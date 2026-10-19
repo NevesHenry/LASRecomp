@@ -9,6 +9,7 @@
 #import <MetalFX/MetalFX.h>
 #include "output_scale.h"
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CAMetalDisplayLink.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 #include <stdatomic.h>
@@ -19,6 +20,7 @@
 #include "renderer.h"
 #include "pace.h"
 #include "texpatch.h"
+#include "interp.h"
 
 static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
@@ -219,7 +221,7 @@ static uint64_t frames, total_frames;
 uint64_t renderer_present_count(void) { return total_frames; }  // (the game thread's frame: the HLE hooks')
 // The frame whose work is being translated (rqueue.h rq_frame): "once per frame" state of the translation. Without the
 // render thread, total_frames.
-uint64_t renderer_exec_frame(void) { return rq_current_item() ? rq_frame() : total_frames; }
+uint64_t renderer_exec_frame(void) { return (rq_current_item() ? rq_frame() : total_frames) + interp_replay_salt(); }
 
 // Output resolution: render targets the game sizes for the 1920x1080 screen are allocated at
 // (sx, sy) times their guest size. Shaders and the renderer keep working in guest ("logical") units.
@@ -415,6 +417,7 @@ static void release_backend_texture(NvnTexture *t, TexBackend *b) {  // (also dr
 }
 
 void backend_texture_destroyed(NvnTexture *t) {
+    interp_texture_destroyed();
     TexBackend *b = t->backend;
     renderer_texture_gone(t, NULL);  // its snapshot copy
     if (b) { reg_remove(b); release_backend_texture(t, b); free(b); }
@@ -1096,25 +1099,120 @@ void renderer_save_texture(id<MTLTexture> tex, const char *path) {
 // ================================================================== present
 
 static double last_fps_time;
+static pthread_mutex_t menu_mx = PTHREAD_MUTEX_INITIALIZER;  // menu_render: the render thread or the interpolation presenter
 
 void backend_present(NvnTexture *t);
+static bool direct_repeat;  // (render thread off) backend_represent's present
 // Present the last frame again (the game thread waits in a host dialog, e.g. the software keyboard): the overlay
 // keeps drawing and taking input.
 void backend_represent(void) {
     if (!g_last_presented) { SDL_Delay(16); return; }
     if (rq_on()) rq_present(g_last_presented, total_frames, false);
-    else backend_present_now(g_last_presented, total_frames);
+    else { direct_repeat = true; backend_present_now(g_last_presented, total_frames); direct_repeat = false; }
 }
 
-// The GPU side of a present (the render thread when it's on, rqueue.c): the present pass, the overlay, shots.
-// frame: the number of this present (the game thread's frame when it was queued).
-void backend_present_now(NvnTexture *t, uint64_t frame) {
-    extern void renderer_submit(void);
-    extern void renderer_texture_will_read(NvnTexture *t);
-    renderer_texture_will_read(t);  // (a recorded clear of the image becomes its pass first)
-    renderer_submit();  // same queue: the present pass runs after the frame's work
-    TexBackend *b = t->backend;
-    if (b) b->presented = true;
+// The game image's placement in the window, set once per game frame (compose with update) and kept for that frame's
+// in-between images.
+static double pl_vx, pl_vy, pl_vw, pl_vh;
+static float pl_crop[4] = {0, 0, 1, 1};
+
+// The present pass: the game image t into dst (cleared) as the window shows it - SMAA, MetalFX, scaled and cropped.
+// update: a new game frame - its placement in the window (and the next frame's render scale) is worked out here.
+static void compose(id<MTLCommandBuffer> cb, NvnTexture *t, id<MTLTexture> dst, uint64_t frame, bool update) {
+    TexBackend *b = t ? t->backend : NULL;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    double dw = dst.width, dh = dst.height;
+    // the game's command buffers and the window image's (LARECOMP_DYNRES_COUNT_PRESENT=0: the game's only, as before)
+    static _Atomic uint64_t present_ns;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {  // (the upscale / scaling draw and the menu)
+        present_ns += (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9);
+    }];
+    if (update) {
+        // Next frame's render resolution follows the window: the 1920x1080 image scaled to fit.
+        extern void widescreen_frame_end(uint64_t frame);
+        widescreen_frame_end(frame);
+        extern void widescreen_set_factor(float f);
+        extern bool widescreen_allowed(void);
+        // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution")
+        extern uint64_t g_gpu_total_ns;
+        static uint64_t gpu_prev;
+        static int count_present = -1;
+        if (count_present < 0) count_present = !getenv("LARECOMP_DYNRES_COUNT_PRESENT") || atoi(getenv("LARECOMP_DYNRES_COUNT_PRESENT"));
+        static uint64_t win_prev;
+        uint64_t gpu_now = __atomic_load_n(&g_gpu_total_ns, __ATOMIC_RELAXED), win_now = present_ns;
+        double game_ms = gpu_prev ? (gpu_now - gpu_prev) / 1e6 : -1, win_ms = count_present ? (win_now - win_prev) / 1e6 : -1;
+        gpu_prev = gpu_now, win_prev = win_now;
+        OutScale os;
+        output_scale(dw, dh, widescreen_allowed(), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
+        double vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh, shape = os.shape;
+        // interiors / dungeons: their 16:9 centre, or the part inside a room wider than one screen
+        extern void widescreen_present_crop(uint64_t, double, float *, double *, double *, double *, double *);
+        float crop[4];  // uv origin and size
+        widescreen_present_crop(frame, shape, crop, &vx, &vy, &vw, &vh);
+        widescreen_set_factor((float)shape);
+        output_scale_log((unsigned long long)frame, dw, dh, &os);  // (diagnostics: [scale] on a change)
+        extern void renderer_set_alloc_scale(float ax, float ay);
+        renderer_set_alloc_scale((float)os.ax, (float)os.ay);
+        renderer_set_scale((float)os.sx, (float)os.sy);
+        pl_vx = vx, pl_vy = vy, pl_vw = vw, pl_vh = vh;
+        memcpy(pl_crop, crop, sizeof crop);
+    }
+    double vx = pl_vx, vy = pl_vy, vw = pl_vw, vh = pl_vh;
+    float crop[4];
+    memcpy(crop, pl_crop, sizeof crop);
+    if (b && b->tex) {
+        id<MTLTexture> src = raw_view(b->tex);
+        // Dynamic: the image occupies the top-left part of the texture (its contents' scale over the allocation's)
+        extern void renderer_texture_fraction(NvnTexture *t, float *fx, float *fy);
+        float fx, fy;
+        renderer_texture_fraction(t, &fx, &fy);
+        g_shot_frac[0] = fx; g_shot_frac[1] = fy;
+        // SMAA (Video tab "Anti-aliasing"): first, at the game image's size (MetalFX then upscales its result)
+        if (g_settings.antialias == AA_SMAA) {
+            [enc endEncoding];
+            src = smaa_encode(cb, src);
+            MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp2.colorAttachments[0].texture = dst;
+            rp2.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+            enc = [cb renderCommandEncoderWithDescriptor:rp2];
+        }
+        // MetalFX (Video tab "Upscaler"): when the game image is smaller than its place in the window, Apple's
+        // spatial upscaler brings it to the window's size first (the whole image, so the interior crop below
+        // still applies); the present pass then samples it about 1:1. Its own pass: the window image's pass is
+        // ended and resumed (load) around it.
+        id<MTLTexture> up = metalfx_upscale(cb, src, fx, fy, vw / crop[2], vh / crop[3]);
+        if (up) {
+            [enc endEncoding];
+            up = metalfx_encode(cb, src, fx, fy);  // (the scaler maps the content part to its whole output)
+            MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp2.colorAttachments[0].texture = dst;
+            rp2.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+            enc = [cb renderCommandEncoderWithDescriptor:rp2];
+            src = up;
+        }
+        memcpy(g_shot_crop, crop, sizeof crop);  // (shots of the game image: the presented crop, of the content part)
+        if (!up) { crop[0] *= fx; crop[1] *= fy; crop[2] *= fx; crop[3] *= fy; }  // (sampled directly: the content part)
+        float flip = renderer_origin_lower_left() ? 1.0f : 0.0f;
+        [enc setViewport:(MTLViewport){vx, vy, vw, vh, 0, 1}];
+        [enc setRenderPipelineState:present_pipe];
+        float pv[8] = {flip, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
+        [enc setVertexBytes:pv length:sizeof pv atIndex:0];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentSamplerState:present_sampler atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+    [enc endEncoding];
+}
+
+// Without frame interpolation: the window's next image, the game image and the overlay. False: no window image.
+static bool present_direct(NvnTexture *t, uint64_t frame) {
     @autoreleasepool {
         uint64_t nd0 = SDL_GetTicksNS();
         rq_watch("nextDrawable", frame);
@@ -1127,94 +1225,12 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             static int warned;
             if (warned++ < 20) LOG("[metal] nextDrawable blocked %llums\n", (unsigned long long)(nd / 1000000));
         }
-        if (!drawable) return;
+        if (!drawable) return false;
         id<MTLCommandBuffer> cb = [queue commandBuffer];
-        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = drawable.texture;
-        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-        // Next frame's render resolution follows the window: the 1920x1080 image scaled to fit.
-        double dw = drawable.texture.width, dh = drawable.texture.height;
-        extern void widescreen_frame_end(uint64_t frame);
-        widescreen_frame_end(frame);
-        extern void widescreen_set_factor(float f);
-        extern bool widescreen_allowed(void);
-        // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution")
-        extern uint64_t g_gpu_total_ns;
-        static uint64_t gpu_prev;
-        // the game's command buffers and the window image's (LARECOMP_DYNRES_COUNT_PRESENT=0: the game's only, as before)
-        static _Atomic uint64_t present_ns;
-        static int count_present = -1;
-        if (count_present < 0) count_present = !getenv("LARECOMP_DYNRES_COUNT_PRESENT") || atoi(getenv("LARECOMP_DYNRES_COUNT_PRESENT"));
-        static uint64_t win_prev;
-        uint64_t gpu_now = __atomic_load_n(&g_gpu_total_ns, __ATOMIC_RELAXED), win_now = present_ns;
-        double game_ms = gpu_prev ? (gpu_now - gpu_prev) / 1e6 : -1, win_ms = count_present ? (win_now - win_prev) / 1e6 : -1;
-        gpu_prev = gpu_now, win_prev = win_now;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {  // (the upscale / scaling draw and the menu)
-            present_ns += (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9);
-        }];
-        OutScale os;
-        output_scale(dw, dh, widescreen_allowed(), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
-        double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh, shape = os.shape;
-        // interiors / dungeons: their 16:9 centre, or the part inside a room wider than one screen
-        extern void widescreen_present_crop(uint64_t, double, float *, double *, double *, double *, double *);
-        float crop[4];  // uv origin and size
-        widescreen_present_crop(frame, shape, crop, &vx, &vy, &vw, &vh);
-        widescreen_set_factor((float)shape);
-        output_scale_log((unsigned long long)frame, dw, dh, &os);  // (diagnostics: [scale] on a change)
-        extern void renderer_set_alloc_scale(float ax, float ay);
-        renderer_set_alloc_scale((float)os.ax, (float)os.ay);
-        renderer_set_scale((float)sx, (float)sy);
-        if (b && b->tex) {
-            id<MTLTexture> src = raw_view(b->tex);
-            // Dynamic: the image occupies the top-left part of the texture (its contents' scale over the allocation's)
-            extern void renderer_texture_fraction(NvnTexture *t, float *fx, float *fy);
-            float fx, fy;
-            renderer_texture_fraction(t, &fx, &fy);
-            g_shot_frac[0] = fx; g_shot_frac[1] = fy;
-            // SMAA (Video tab "Anti-aliasing"): first, at the game image's size (MetalFX then upscales its result)
-            if (g_settings.antialias == AA_SMAA) {
-                [enc endEncoding];
-                src = smaa_encode(cb, src);
-                MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
-                rp2.colorAttachments[0].texture = drawable.texture;
-                rp2.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
-                enc = [cb renderCommandEncoderWithDescriptor:rp2];
-            }
-            // MetalFX (Video tab "Upscaler"): when the game image is smaller than its place in the window, Apple's
-            // spatial upscaler brings it to the window's size first (the whole image, so the interior crop below
-            // still applies); the present pass then samples it about 1:1. Its own pass: the drawable's pass is
-            // ended and resumed (load) around it.
-            id<MTLTexture> up = metalfx_upscale(cb, src, fx, fy, vw / crop[2], vh / crop[3]);
-            if (up) {
-                [enc endEncoding];
-                up = metalfx_encode(cb, src, fx, fy);  // (the scaler maps the content part to its whole output)
-                MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
-                rp2.colorAttachments[0].texture = drawable.texture;
-                rp2.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
-                enc = [cb renderCommandEncoderWithDescriptor:rp2];
-                src = up;
-            }
-            memcpy(g_shot_crop, crop, sizeof crop);  // (shots of the game image: the presented crop, of the content part)
-            if (!up) { crop[0] *= fx; crop[1] *= fy; crop[2] *= fx; crop[3] *= fy; }  // (sampled directly: the content part)
-            float flip = renderer_origin_lower_left() ? 1.0f : 0.0f;
-            [enc setViewport:(MTLViewport){vx, vy, vw, vh, 0, 1}];
-            [enc setRenderPipelineState:present_pipe];
-            float pv[8] = {flip, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
-            [enc setVertexBytes:pv length:sizeof pv atIndex:0];
-            [enc setFragmentTexture:src atIndex:0];
-            [enc setFragmentSamplerState:present_sampler atIndex:0];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        }
-        [enc endEncoding];
-        static long menu_at = -1;  // test hook: open the menu at this frame (LARECOMP_MENU_AT)
-        if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
-        if (menu_at && (long)frame + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
+        compose(cb, t, drawable.texture, frame, true);
+        pthread_mutex_lock(&menu_mx);
         menu_render(dev, cb, drawable.texture);
+        pthread_mutex_unlock(&menu_mx);
         static long win_shot = -1;  // LARECOMP_WINDOW_SHOT=<frame>: save the final window image (game + menu)
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
         id<MTLTexture> shot_tex = nil;
@@ -1244,6 +1260,12 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             g_save_upright = false;
         }
     }
+    return true;
+}
+
+// After a game frame's image: periodic shots of the game image, the fps line.
+static void present_tail(NvnTexture *t, uint64_t frame) {
+    TexBackend *b = t ? t->backend : NULL;
     frames++;
     static long shot_every = -1;
     if (shot_every < 0) { const char *e = getenv("LARECOMP_SCREENSHOT_EVERY"); shot_every = e ? atol(e) : 0; }
@@ -1279,6 +1301,406 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     }
 }
 
+// ---------------------------------------------------------------- frame interpolation (runtime/nvn/interp.c)
+// The render thread makes the images - the game's own frame and its in-betweens, each the full present pass into an
+// image of the window's size ("slot") with the time it's due on screen - and a presenter thread driven by the
+// display (CAMetalDisplayLink) shows, at every vsync, the newest slot that's due, with the overlay (menu, FPS, tracker)
+// drawn on top of each image. The game's frame pacing is untouched: its frames reach the render thread as before.
+//   LARECOMP_INTERP_SEQ=<from>:<count>:<dir>  save every image shown for game frames from..from+count-1
+//                                             (<dir>/<n>_f<frame>_<g|m|r>.png: game / in-between / repeated)
+enum { SL_FREE, SL_RENDER, SL_READY };
+enum { K_GAME, K_MID, K_REPEAT };
+#define NSLOT 16
+static id<MTLTexture> sl_tex[NSLOT];
+static uint64_t sl_at[NSLOT], sl_frame[NSLOT];
+static int sl_state[NSLOT], sl_kind[NSLOT], sl_readers[NSLOT];
+static int ip_shown = -1;  // the slot on screen (the presenter's latest)
+static pthread_mutex_t sl_mx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool ip_on;           // the presenter shows slots
+static _Atomic uint64_t ip_phase, ip_period, ip_last_cb;  // the display: a vsync's time, its period; the latest callback
+static uint64_t ip_on_since, ip_prev_stamp;
+static id<MTLCommandQueue> ip_queue;
+static CFRunLoopRef ip_loop;
+static id ip_link;  // CAMetalDisplayLink
+static double ip_lead_ms;  // (stats) how long before its vsync the presenter is asked for an image
+static double ip_latency = 2;  // the link's frame latency (LARECOMP_INTERP_LATENCY=<frames>): how early it asks
+
+// A slot for an image of w x h; force (the game's own frame): take the oldest one not on screen if none is free.
+static int slot_claim(NSUInteger w, NSUInteger h, bool force) {
+    int got = -1;
+    for (int tries = 0; got < 0 && tries < (force ? 50 : 1); tries++) {
+        if (tries) usleep(1000);
+        pthread_mutex_lock(&sl_mx);
+        for (int i = 0; i < NSLOT && got < 0; i++) if (sl_state[i] == SL_FREE) got = i;
+        if (got < 0 && force) {
+            for (int i = 0; i < NSLOT; i++)
+                if (sl_state[i] == SL_READY && i != ip_shown && !sl_readers[i] && (got < 0 || sl_at[i] < sl_at[got])) got = i;
+        }
+        if (got >= 0) sl_state[got] = SL_RENDER;
+        pthread_mutex_unlock(&sl_mx);
+    }
+    if (got < 0) return -1;
+    if (!sl_tex[got] || sl_tex[got].width != w || sl_tex[got].height != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:layer.pixelFormat width:w height:h
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        sl_tex[got] = [dev newTextureWithDescriptor:td];
+    }
+    return got;
+}
+
+static void slot_commit(id<MTLCommandBuffer> cb, int i, uint64_t at, uint64_t frame, int kind) {
+    sl_at[i] = at, sl_frame[i] = frame, sl_kind[i] = kind;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (kind == K_MID) interp_compose_gpu((done.GPUEndTime - done.GPUStartTime) * 1e3);
+        pthread_mutex_lock(&sl_mx);
+        if (sl_state[i] == SL_RENDER) sl_state[i] = SL_READY;
+        pthread_mutex_unlock(&sl_mx);
+    }];
+    [cb commit];
+}
+
+static void slots_drop(void) {  // (the presenter stops / restarts: nothing old shows again)
+    pthread_mutex_lock(&sl_mx);
+    for (int i = 0; i < NSLOT; i++) if (sl_state[i] == SL_READY && !sl_readers[i]) sl_state[i] = SL_FREE;
+    ip_shown = -1;
+    pthread_mutex_unlock(&sl_mx);
+}
+
+// ---- what reached the screen (presented handlers): images per second, their spacing
+static pthread_mutex_t st_mx = PTHREAD_MUTEX_INITIALIZER;
+static void ip_presented(double t, double target, int kind) {
+    static double last, win0, sum, sum2, dmin = 1e9, dmax, late, period_ms;
+    static uint64_t nd, shown[3], dropped, even;
+    pthread_mutex_lock(&st_mx);
+    if (t <= 0) dropped++;
+    else {
+        if (last > 0 && t > last) {
+            double d = (t - last) * 1000;
+            sum += d, sum2 += d * d, nd++;
+            if (d < dmin) dmin = d;
+            if (d > dmax) dmax = d;
+            period_ms = atomic_load(&ip_period) / 1e6;
+            if (period_ms > 0 && fabs(d - period_ms) < 1.0) even++;
+        }
+        last = t;
+        shown[kind]++;
+        late += (t - target) * 1000;
+        if (!win0) win0 = t;
+    }
+    static double every = -1;
+    if (every < 0) { const char *e = getenv("LARECOMP_INTERP_LOG"); every = e ? atof(e) : 2.0; }
+    if (every > 0 && win0 && t - win0 >= every) {
+        double dt = t - win0, n = (double)(shown[0] + shown[1] + shown[2]), mean = nd ? sum / nd : 0;
+        LOG("[interp] screen: %.1f images/s (game %.1f, in-between %.1f, repeated %.1f), dropped %llu | spacing %.2f ms avg, "
+            "sd %.2f, min %.2f, max %.2f; %.1f%% within 1 ms of the display's %.2f ms | on screen vs due %+.2f ms, asked %.1f ms ahead\n",
+            n / dt, shown[0] / dt, shown[1] / dt, shown[2] / dt, (unsigned long long)dropped, mean,
+            nd ? sqrt(fmax(0, sum2 / nd - mean * mean)) : 0, nd ? dmin : 0, dmax, nd ? 100.0 * even / nd : 0, period_ms,
+            n ? late / n : 0, ip_lead_ms);
+        win0 = t, sum = sum2 = dmax = late = 0, dmin = 1e9, nd = dropped = even = 0;
+        memset(shown, 0, sizeof shown);
+    }
+    pthread_mutex_unlock(&st_mx);
+}
+
+// ---- shots of the window image (overlay included), written off the presenter thread
+static dispatch_queue_t shot_q;
+static void shot_write(id<MTLTexture> tex, const char *path, bool exit_after) {
+    if (!shot_q) shot_q = dispatch_queue_create("interp.shots", DISPATCH_QUEUE_SERIAL);
+    char *p = strdup(path);
+    dispatch_async(shot_q, ^{
+        NSUInteger w = tex.width, h = tex.height;
+        uint8_t *px = malloc(w * h * 4);
+        [tex getBytes:px bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        for (NSUInteger i = 0; i < w * h; i++) { uint8_t c = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = c; px[i * 4 + 3] = 255; }
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, kCGImageAlphaPremultipliedLast);
+        CGImageRef img = CGBitmapContextCreateImage(ctx);
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)p, strlen(p), false);
+        CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
+        if (dest) { CGImageDestinationAddImage(dest, img, NULL); CGImageDestinationFinalize(dest); CFRelease(dest); }
+        CFRelease(url); CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
+        free(px);
+        LOG("[interp] saved %s\n", p);
+        free(p);
+        if (exit_after) { fflush(stderr); _exit(0); }
+    });
+}
+
+// ---- the presenter (CAMetalDisplayLink's thread): one image per vsync
+static void ip_update(id<CAMetalDrawable> drawable, double target_s) {
+    uint64_t tp = (uint64_t)(target_s * 1e9), last_tp = atomic_load(&ip_phase);
+    static double period;
+    if (last_tp && tp > last_tp) {  // (the display's period: the targets' spacing, smoothed; skipped vsyncs left out)
+        double d = (double)(tp - last_tp);
+        if (!period) period = d;
+        else if (d > period * 0.5 && d < period * 1.5) period += (d - period) * 0.05;
+        atomic_store(&ip_period, (uint64_t)period);
+    }
+    atomic_store(&ip_phase, tp);
+    uint64_t cb_now = plat_now_ns();
+    atomic_store(&ip_last_cb, cb_now);
+    ip_lead_ms += ((tp > cb_now ? (tp - cb_now) / 1e6 : 0) - ip_lead_ms) * 0.02;
+    if (!atomic_load(&ip_on) || !drawable) return;
+    double P = period ? period : 16666667.0;
+    pthread_mutex_lock(&sl_mx);
+    int best = -1;
+    for (int i = 0; i < NSLOT; i++)
+        if (sl_state[i] == SL_READY && sl_at[i] <= tp + P * 0.25 && (best < 0 || sl_at[i] > sl_at[best])) best = i;
+    if (best < 0 && ip_shown >= 0 && sl_state[ip_shown] == SL_READY) best = ip_shown;
+    if (best < 0) { pthread_mutex_unlock(&sl_mx); return; }  // (nothing made yet: the window keeps what it shows)
+    for (int i = 0; i < NSLOT; i++)  // (older than what's shown now: done with)
+        if (i != best && sl_state[i] == SL_READY && !sl_readers[i] && sl_at[i] < sl_at[best]) sl_state[i] = SL_FREE;
+    int kind = best == ip_shown ? K_REPEAT : sl_kind[best];
+    ip_shown = best;
+    sl_readers[best]++;
+    id<MTLTexture> src = sl_tex[best];
+    uint64_t frame = sl_frame[best];
+    pthread_mutex_unlock(&sl_mx);
+
+    id<MTLTexture> target = drawable.texture;
+    // shots: LARECOMP_WINDOW_SHOT=<frame> (the game frame's own image), hookshot.c's request, LARECOMP_INTERP_SEQ
+    static long win_shot = -1, seq_from, seq_n, seq_i;
+    static char seq_dir[200];
+    if (win_shot < 0) {
+        win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
+        const char *e = getenv("LARECOMP_INTERP_SEQ");
+        if (e) sscanf(e, "%ld:%ld:%199s", &seq_from, &seq_n, seq_dir);
+    }
+    extern char g_window_shot_request[256];
+    char path[300] = "";
+    bool exit_after = false;
+    if (win_shot && kind == K_GAME && (long)frame + 1 == win_shot) {
+        snprintf(path, sizeof path, "%s", getenv("LARECOMP_SHOT_PATH") ? getenv("LARECOMP_SHOT_PATH") : "build/window.png");
+        exit_after = getenv("LARECOMP_EXIT_AFTER_SHOT") != NULL;
+    } else if (g_window_shot_request[0]) {
+        snprintf(path, sizeof path, "%s", g_window_shot_request);
+        g_window_shot_request[0] = 0;
+    } else if (seq_n && (long)frame >= seq_from && (long)frame < seq_from + seq_n) {
+        snprintf(path, sizeof path, "%s/%04ld_f%llu_%c.png", seq_dir, seq_i++, (unsigned long long)frame, "gmr"[kind]);
+    }
+    id<MTLCommandBuffer> cb = [ip_queue commandBuffer];
+    id<MTLTexture> shot = nil;
+    if (path[0]) {  // (drawn into an image of our own first: the window's can't be read back)
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:target.pixelFormat
+                                     width:target.width height:target.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeShared;
+        shot = [dev newTextureWithDescriptor:td];
+        target = shot;
+    }
+    for (int pass = 0; pass < (shot ? 2 : 1); pass++) {
+        id<MTLTexture> dst = pass ? drawable.texture : target, from = pass ? shot : src;
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setViewport:(MTLViewport){0, 0, dst.width, dst.height, 0, 1}];
+        [enc setRenderPipelineState:present_pipe];
+        float pv[8] = {0, 0, 0, 0, 0, 0, 1, 1};
+        [enc setVertexBytes:pv length:sizeof pv atIndex:0];
+        [enc setFragmentTexture:from atIndex:0];
+        [enc setFragmentSamplerState:present_sampler atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        if (!pass) {
+            pthread_mutex_lock(&menu_mx);
+            menu_render(dev, cb, dst);
+            pthread_mutex_unlock(&menu_mx);
+        }
+    }
+    int b = best;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        pthread_mutex_lock(&sl_mx);
+        sl_readers[b]--;
+        pthread_mutex_unlock(&sl_mx);
+    }];
+    if (shot) {
+        id<MTLTexture> s = shot;
+        char *p = strdup(path);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; shot_write(s, p, exit_after); free(p); }];
+    }
+    [drawable addPresentedHandler:^(id<MTLDrawable> d) { ip_presented(d.presentedTime, target_s, kind); }];
+    [cb presentDrawable:drawable];
+    [cb commit];
+}
+
+API_AVAILABLE(macos(14.0))
+@interface IpLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
+@end
+@implementation IpLinkDelegate
+- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
+    (void)link;
+    @autoreleasepool { ip_update(update.drawable, update.targetPresentationTimestamp); }
+}
+@end
+
+static void *ip_thread(void *arg) {
+    (void)arg;
+    pthread_setname_np("interp presenter");
+    plat_thread_guest(44);
+    if (@available(macOS 14.0, *)) {
+        @autoreleasepool {
+            ip_queue = [dev newCommandQueue];
+            static IpLinkDelegate *del;
+            del = [IpLinkDelegate new];
+            CAMetalDisplayLink *link = [[CAMetalDisplayLink alloc] initWithMetalLayer:layer];
+            link.delegate = del;
+            link.preferredFrameRateRange = CAFrameRateRangeMake(30, 240, 240);
+            link.preferredFrameLatency = (float)ip_latency;
+            [link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+            ip_link = link;
+            ip_loop = CFRunLoopGetCurrent();
+            CFRetain(ip_loop);
+        }
+        for (;;) @autoreleasepool { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false); }
+    }
+    return NULL;
+}
+
+static void ip_set_paused(bool paused) {
+    if (!ip_loop) return;
+    if (@available(macOS 14.0, *)) {
+        CAMetalDisplayLink *link = ip_link;
+        CFRunLoopPerformBlock(ip_loop, kCFRunLoopDefaultMode, ^{ link.paused = paused; });
+        CFRunLoopWakeUp(ip_loop);
+    }
+}
+
+// The presenter runs and shows slots: true once the display link calls (a hidden window's never does: the plain
+// present then).
+static bool ip_start(void) {
+    if (@available(macOS 14.0, *)) {} else return false;
+    static bool started;
+    uint64_t now = plat_now_ns();
+    if (!started) {
+        started = true;
+        if (getenv("LARECOMP_INTERP_LATENCY")) ip_latency = atof(getenv("LARECOMP_INTERP_LATENCY"));
+        pthread_t th;
+        pthread_create(&th, NULL, ip_thread, NULL);
+        LOG("[interp] frame interpolation presenter started\n");
+    }
+    if (!atomic_load(&ip_on)) {
+        slots_drop();
+        ip_prev_stamp = 0;
+        ip_on_since = now;
+        atomic_store(&ip_on, true);
+        ip_set_paused(false);
+    }
+    uint64_t last = atomic_load(&ip_last_cb);
+    bool alive = last && now - last < 250000000ull;
+    static bool said;
+    if (!alive && now - ip_on_since > 1000000000ull && !said) {
+        said = true;
+        LOG("[interp] the display link doesn't call (hidden window?): frames shown without interpolation\n");
+    }
+    if (alive) said = false;
+    return alive;
+}
+
+static void ip_stop(void) {
+    if (!atomic_load(&ip_on)) return;
+    atomic_store(&ip_on, false);
+    ip_set_paused(true);
+    LOG("[interp] frame interpolation off\n");
+}
+
+// The present with frame interpolation (render thread). False: not possible now (the plain present shows the frame).
+static bool ip_present(NvnTexture *t, uint64_t frame, bool repeat) {
+    TexBackend *b = t ? t->backend : NULL;
+    if (!b || !b->tex || !ip_start()) return false;
+    if (repeat) { usleep(16000); return true; }  // (the game waits in a dialog: the presenter keeps the image + overlay)
+    uint64_t now = plat_now_ns();
+    {   // a level change is a cut
+        extern const char *game_level_name(void);
+        static char last[64];
+        const char *lv = game_level_name();
+        if (strncmp(lv, last, sizeof last - 1) != 0) { strlcpy(last, lv, sizeof last); interp_force_cut(); }
+    }
+    CGSize ds = layer.drawableSize;
+    NSUInteger dw = ds.width >= 16 ? (NSUInteger)ds.width : 16, dh = ds.height >= 16 ? (NSUInteger)ds.height : 16;
+    bool blend = interp_frame_end(true);
+    uint64_t s1 = interp_stamp_of(frame), s0 = ip_prev_stamp;
+    ip_prev_stamp = s1;
+    if (!s0) blend = false;
+    InterpShot sh[10];
+    uint64_t per = atomic_load(&ip_period);
+    int n = interp_schedule(s0, s1, now, atomic_load(&ip_phase), per, (uint64_t)(ip_latency * (per ? per : 16666667)), blend, sh, 10);
+    float rsx, rsy, rax = g_al_x, ray = g_al_y;  // (the scale this frame was drawn at: compose sets the next one's)
+    renderer_get_scale(&rsx, &rsy);
+    int gi = slot_claim(dw, dh, true);
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    if (gi >= 0) {
+        compose(cb, t, sl_tex[gi], frame, true);
+        slot_commit(cb, gi, sh[n - 1].at, frame, K_GAME);
+    } else {
+        static id<MTLTexture> spare;  // (no slot: the placement still has to be worked out)
+        if (!spare || spare.width != dw || spare.height != dh) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:layer.pixelFormat width:dw
+                                                                                        height:dh mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget;
+            td.storageMode = MTLStorageModePrivate;
+            spare = [dev newTextureWithDescriptor:td];
+        }
+        compose(cb, t, spare, frame, true);
+        [cb commit];
+    }
+    present_tail(t, frame);
+    int mids = 0;
+    for (int i = 0; i < n; i++) mids += sh[i].t < 1.0f;
+    if (mids && interp_replay_lock()) {
+        float nsx, nsy, nax = g_al_x, nay = g_al_y;
+        renderer_get_scale(&nsx, &nsy);
+        renderer_set_scale(rsx, rsy);
+        renderer_set_alloc_scale(rax, ray);
+        for (int i = 0; i < n; i++) {
+            if (sh[i].t >= 1.0f) continue;
+            int si = slot_claim(dw, dh, false);
+            if (si < 0) { interp_note_skipped(); continue; }
+            interp_prepare(sh[i].t);
+            extern void renderer_interp_replay(void);
+            renderer_interp_replay();
+            id<MTLCommandBuffer> c2 = [queue commandBuffer];
+            compose(c2, t, sl_tex[si], frame, false);
+            slot_commit(c2, si, sh[i].at, frame, K_MID);
+        }
+        renderer_set_scale(nsx, nsy);
+        renderer_set_alloc_scale(nax, nay);
+        interp_replay_unlock();
+    }
+    interp_frame_rotate();
+    interp_log_stats();
+    return true;
+}
+
+// The GPU side of a present (the render thread when it's on, rqueue.c): the present pass, the overlay, shots.
+// frame: the number of this present (the game thread's frame when it was queued).
+void backend_present_now(NvnTexture *t, uint64_t frame) {
+    extern void renderer_submit(void);
+    extern void renderer_texture_will_read(NvnTexture *t);
+    renderer_texture_will_read(t);  // (a recorded clear of the image becomes its pass first)
+    renderer_submit();  // same queue: the present pass runs after the frame's work
+    TexBackend *b = t->backend;
+    if (b) b->presented = true;
+    static long menu_at = -1;  // test hook: open the menu at this frame (LARECOMP_MENU_AT)
+    if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
+    if (menu_at && (long)frame + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
+    bool repeat = rq_on() ? rq_present_is_repeat() : direct_repeat;
+    int want = interp_wanted();
+    if (want == INTERP_ON && ip_present(t, frame, repeat)) return;
+    if (want != INTERP_ON) ip_stop();
+    if (!repeat) {  // (measure, or on without a presenter: matched and logged only)
+        interp_frame_end(want != INTERP_OFF);
+        interp_frame_rotate();
+        if (want != INTERP_OFF) interp_log_stats();
+    }
+    if (present_direct(t, frame)) present_tail(t, frame);
+}
+
 // The game thread's side of a present: the frame counters and the per-frame hooks (input, pacing, test hooks).
 static void present_hooks(void) {
     total_frames++;
@@ -1310,6 +1732,8 @@ static void present_hooks(void) {
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
     uint64_t frame = total_frames, t0 = plat_now_ns();
+    extern volatile uint64_t g_vsync_ns;  // (runtime/hle/vi.c: the emulated vsync this frame was made in - frame interpolation)
+    interp_stamp(frame, g_vsync_ns ? g_vsync_ns : t0);
     if (rq_on()) rq_present(t, frame, true);
     else backend_present_now(t, frame);
     uint64_t t1 = plat_now_ns();
@@ -1335,8 +1759,15 @@ void ui_window_init(void) {
     // LARECOMP_HIDDEN=1: never shown (automated test runs render off screen without taking the user's focus)
     SDL_WindowFlags wflags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (getenv("LARECOMP_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
+    // (tests) LARECOMP_NO_ACTIVATE=1: a visible window that doesn't take the focus; LARECOMP_WINDOW_POS=<x>,<y>
+    if (getenv("LARECOMP_NO_ACTIVATE")) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
     window = SDL_CreateWindow("LAS Recomp", win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
+    if (getenv("LARECOMP_WINDOW_POS")) {
+        int x = 0, y = 0;
+        sscanf(getenv("LARECOMP_WINDOW_POS"), "%d,%d", &x, &y);
+        SDL_SetWindowPosition(window, x, y);
+    }
     rt_window_icon(window);
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
@@ -1350,7 +1781,7 @@ void ui_window_init(void) {
     // display), for ~2-3 fps near the limit at most (the game paces itself to vi.c's emulated 60 Hz vsync, and the two
     // clocks drift). LARECOMP_DISPLAY_SYNC=0: off (tests).
     layer.displaySyncEnabled = !getenv("LARECOMP_DISPLAY_SYNC") || atoi(getenv("LARECOMP_DISPLAY_SYNC")) != 0;
-    layer.framebufferOnly = getenv("LARECOMP_WINDOW_SHOT") ? NO : YES;
+    layer.framebufferOnly = getenv("LARECOMP_WINDOW_SHOT") ? NO : YES;  // (frame interpolation's shots: their own image)
 }
 
 SDL_Window *ui_window(void) { return window; }

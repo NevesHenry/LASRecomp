@@ -9,6 +9,7 @@ static uint32_t vsync_r, vsync_w;
 static KEvent *vsync_event;
 uint32_t vi_vsync_handle(void) { return vsync_r; }
 volatile uint64_t g_vsync_count;  // vsyncs signalled so far (runtime/hle/framepace.c)
+volatile uint64_t g_vsync_ns;     // when the latest one was due (plat_now_ns; frame interpolation's game timeline)
 uint64_t g_native_window;
 
 static void *vsync_thread(void *arg) {
@@ -25,6 +26,7 @@ static void *vsync_thread(void *arg) {
             if (warned++ < 20) LOG("[vi] vsync timer late by %llums (host throttling?)\n", (unsigned long long)((now - next) / 1000000));
             next = now;  // don't burst-signal to catch up
         }
+        __atomic_store_n(&g_vsync_ns, next, __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_vsync_count, 1, __ATOMIC_RELAXED);
         pthread_mutex_lock(&g_klock);
         kernel_signal(vsync_event);
