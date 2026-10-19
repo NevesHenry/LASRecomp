@@ -2679,7 +2679,7 @@ static void draw(CmdRec *r, bool indexed) {
                 }
             }
         }
-        interp_draw(fkey);
+        interp_draw(fkey, st.rt.ncolor == 0);
     }
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
