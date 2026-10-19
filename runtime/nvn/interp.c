@@ -48,7 +48,12 @@ int interp_wanted(void) {
 #endif
 }
 
-typedef struct { uint8_t stage, slot; uint32_t off, size; int64_t prev_off; int64_t blend; } CbRec;
+typedef struct {
+    uint8_t stage, slot, snap;  // snap: elements past the jump distance show the new value (a jump, not motion)
+    uint32_t off, size;
+    int64_t prev_off, blend;
+    float maxd;  // the largest element change from the previous frame (-1: not matched): how fast it was moving
+} CbRec;
 typedef struct { uint64_t key; uint32_t occ, first_cb, ncb; } DrawRec;
 typedef struct {
     DrawRec *draws; uint32_t ndraws, cap_draws;
@@ -186,6 +191,7 @@ const void *interp_cbuf(int stage, int k, int slot, const void *src, uint64_t si
     CbRec *c = &cur->cbs[cur->ncbs++];
     c->stage = (uint8_t)stage, c->slot = (uint8_t)slot, c->off = (uint32_t)cur->nbytes, c->size = (uint32_t)size;
     c->prev_off = c->blend = -1;
+    c->snap = 0, c->maxd = -1;
     memcpy(cur->bytes + cur->nbytes, src, size);
     cur->nbytes += (size + 15) & ~15ull;
     d->ncb++;
@@ -264,13 +270,26 @@ bool interp_frame_end(bool log_next) {
             if (cc->stage != pc->stage || cc->slot != pc->slot || cc->size != pc->size) continue;
             if (!(stages & (cc->stage == 0 ? 1 : 2))) continue;
             const float *a = (const float *)(prev->bytes + pc->off), *b = (const float *)(cur->bytes + cc->off);
-            if (!memcmp(a, b, cc->size)) continue;
+            if (!memcmp(a, b, cc->size)) { cc->maxd = 0; continue; }
             changed++;
             uint32_t nf = cc->size / 4;
-            bool jump = false;  // (an element moved further than a frame's motion: a cut / teleport - no blend)
-            uint32_t q = 0;
-            for (; q < nf && !jump; q++)
-                jump = blendable(a[q], b[q]) && fabsf(b[q] - a[q]) > cut + 0.05f * fmaxf(fabsf(a[q]), fabsf(b[q]));
+            // A jump: an element moved further than the jump distance in one frame - and much further than the buffer
+            // moved the frame before. Steady fast motion (a dungeon's room-to-room scroll: its camera moves far each
+            // frame, every frame) blends; deciding it per frame by distance alone made such a scroll alternate
+            // between blended and snapped in-betweens: flicker.
+            float maxd = 0;
+            uint32_t q = 0, jq = 0;
+            bool far = false;
+            for (; q < nf; q++) {
+                if (!blendable(a[q], b[q])) continue;
+                float d = fabsf(b[q] - a[q]);
+                if (d > maxd) maxd = d;
+                if (!far && d > cut + 0.05f * fmaxf(fabsf(a[q]), fabsf(b[q]))) far = true, jq = q + 1;
+            }
+            cc->maxd = maxd;
+            bool jump = far && (pc->maxd < 0 || maxd > 2.5f * pc->maxd + cut);
+            q = jq;
+            cc->snap = jump;
             if (jump) {
                 static int nlog;  // LARECOMP_INTERP_LOG_JUMPS=<frame>: log jumping buffers from that frame on
                 static long from = -1;
@@ -318,7 +337,8 @@ bool interp_prepare(float t) {
         uint32_t nf = cc->size / 4;
         float cut = cut_threshold();
         for (uint32_t q = 0; q < nf; q++)
-            out[q] = blendable(a[q], b[q]) && fabsf(b[q] - a[q]) <= cut + 0.05f * fmaxf(fabsf(a[q]), fabsf(b[q]))
+            out[q] = blendable(a[q], b[q]) &&
+                     (!cc->snap || fabsf(b[q] - a[q]) <= cut + 0.05f * fmaxf(fabsf(a[q]), fabsf(b[q])))
                    ? a[q] + (b[q] - a[q]) * t : b[q];
         memcpy((uint8_t *)out + nf * 4, (const uint8_t *)b + nf * 4, cc->size - nf * 4);
         cc->blend = (int64_t)blend_n;
