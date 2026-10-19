@@ -9,7 +9,8 @@
 #import <MetalFX/MetalFX.h>
 #include "output_scale.h"
 #import <QuartzCore/CAMetalLayer.h>
-#import <QuartzCore/CAMetalDisplayLink.h>
+#import <CoreVideo/CoreVideo.h>
+#include <mach/mach_time.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 #include <stdatomic.h>
@@ -1244,6 +1245,11 @@ static bool present_direct(NvnTexture *t, uint64_t frame) {
             [bl copyFromTexture:drawable.texture toTexture:shot_tex];
             [bl endEncoding];
         }
+        if (!direct_repeat && !rq_present_is_repeat()) {
+            static int lat = -1;
+            if (lat < 0) lat = getenv("LARECOMP_LOG_LATENCY") != NULL;
+            if (lat) [drawable addPresentedHandler:^(id<MTLDrawable> d) { interp_latency_shown(frame, d.presentedTime, false); }];
+        }
         [cb presentDrawable:drawable];
         [cb commit];
         if (shot_tex) {
@@ -1320,10 +1326,10 @@ static _Atomic bool ip_on;           // the presenter shows slots
 static _Atomic uint64_t ip_phase, ip_period, ip_last_cb;  // the display: a vsync's time, its period; the latest callback
 static uint64_t ip_on_since, ip_prev_stamp;
 static id<MTLCommandQueue> ip_queue;
-static CFRunLoopRef ip_loop;
-static id ip_link;  // CAMetalDisplayLink
+static uint64_t ip_wake_ns = 4000000, ip_wake_tp;
+static pthread_mutex_t ip_wake_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ip_wake_cv = PTHREAD_COND_INITIALIZER;
 static double ip_lead_ms;  // (stats) how long before its vsync the presenter is asked for an image
-static double ip_latency = 2;  // the link's frame latency (LARECOMP_INTERP_LATENCY=<frames>): how early it asks
 
 // A slot for an image of w x h; force (the game's own frame): take the oldest one not on screen if none is free.
 static int slot_claim(NSUInteger w, NSUInteger h, bool force) {
@@ -1428,30 +1434,25 @@ static void shot_write(id<MTLTexture> tex, const char *path, bool exit_after) {
     });
 }
 
-// ---- the presenter (CAMetalDisplayLink's thread): one image per vsync
-static void ip_update(id<CAMetalDrawable> drawable, double target_s) {
-    uint64_t tp = (uint64_t)(target_s * 1e9), last_tp = atomic_load(&ip_phase);
-    static double period;
-    if (last_tp && tp > last_tp) {  // (the display's period: the targets' spacing, smoothed; skipped vsyncs left out)
-        double d = (double)(tp - last_tp);
-        if (!period) period = d;
-        else if (d > period * 0.5 && d < period * 1.5) period += (d - period) * 0.05;
-        atomic_store(&ip_period, (uint64_t)period);
-    }
-    atomic_store(&ip_phase, tp);
-    uint64_t cb_now = plat_now_ns();
-    atomic_store(&ip_last_cb, cb_now);
+// ---- the presenter (a display link's thread, CVDisplayLink: CAMetalDisplayLink forbids the plain present's
+// nextDrawable on the same window): one image per vsync, shown on the vsync it was made for
+static void ip_tick(uint64_t tp) {
+    uint64_t cb_now = plat_now_ns(), period = atomic_load(&ip_period);
     ip_lead_ms += ((tp > cb_now ? (tp - cb_now) / 1e6 : 0) - ip_lead_ms) * 0.02;
-    if (!atomic_load(&ip_on) || !drawable) return;
-    double P = period ? period : 16666667.0;
+    if (!atomic_load(&ip_on)) return;
+    double P = period ? (double)period : 16666667.0;
     pthread_mutex_lock(&sl_mx);
     int best = -1;
+    // the newest game frame's latest image that's due (a newer frame's images win over an older one's: a frame that
+    // came early replaces the previous one's extrapolated images)
+#define NEWER(i, j) (sl_frame[i] != sl_frame[j] ? sl_frame[i] > sl_frame[j] : sl_at[i] > sl_at[j])
     for (int i = 0; i < NSLOT; i++)
-        if (sl_state[i] == SL_READY && sl_at[i] <= tp + P * 0.25 && (best < 0 || sl_at[i] > sl_at[best])) best = i;
+        if (sl_state[i] == SL_READY && sl_at[i] <= tp + P * 0.25 && (best < 0 || NEWER(i, best))) best = i;
     if (best < 0 && ip_shown >= 0 && sl_state[ip_shown] == SL_READY) best = ip_shown;
     if (best < 0) { pthread_mutex_unlock(&sl_mx); return; }  // (nothing made yet: the window keeps what it shows)
     for (int i = 0; i < NSLOT; i++)  // (older than what's shown now: done with)
-        if (i != best && sl_state[i] == SL_READY && !sl_readers[i] && sl_at[i] < sl_at[best]) sl_state[i] = SL_FREE;
+        if (i != best && sl_state[i] == SL_READY && !sl_readers[i] && NEWER(best, i)) sl_state[i] = SL_FREE;
+#undef NEWER
     int kind = best == ip_shown ? K_REPEAT : sl_kind[best];
     ip_shown = best;
     sl_readers[best]++;
@@ -1459,6 +1460,14 @@ static void ip_update(id<CAMetalDrawable> drawable, double target_s) {
     uint64_t frame = sl_frame[best];
     pthread_mutex_unlock(&sl_mx);
 
+    // the window's next image (up to 3 in flight: waits for one to come off screen at most)
+    id<CAMetalDrawable> drawable = [layer nextDrawable];
+    if (!drawable) {
+        pthread_mutex_lock(&sl_mx);
+        sl_readers[best]--;
+        pthread_mutex_unlock(&sl_mx);
+        return;
+    }
     id<MTLTexture> target = drawable.texture;
     // shots: LARECOMP_WINDOW_SHOT=<frame> (the game frame's own image), hookshot.c's request, LARECOMP_INTERP_SEQ
     static long win_shot = -1, seq_from, seq_n, seq_i;
@@ -1524,88 +1533,103 @@ static void ip_update(id<CAMetalDrawable> drawable, double target_s) {
         char *p = strdup(path);
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; shot_write(s, p, exit_after); free(p); }];
     }
-    [drawable addPresentedHandler:^(id<MTLDrawable> d) { ip_presented(d.presentedTime, target_s, kind); }];
-    [cb presentDrawable:drawable];
+    double target_s = tp / 1e9;
+    [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+        ip_presented(d.presentedTime, target_s, kind);
+        if (kind == K_GAME) interp_latency_shown(frame, d.presentedTime, true);
+    }];
+    // (at the vsync it was made for: presented as soon as drawn instead, half the images doubled up and the other half
+    // were never seen)
+    [cb presentDrawable:drawable atTime:target_s];
     [cb commit];
 }
 
-API_AVAILABLE(macos(14.0))
-@interface IpLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
-@end
-@implementation IpLinkDelegate
-- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
-    (void)link;
-    @autoreleasepool { ip_update(update.drawable, update.targetPresentationTimestamp); }
-}
-@end
 
-static void *ip_thread(void *arg) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"  // (CVDisplayLink: the display-link API without a layer)
+static CVDisplayLinkRef ip_cv;
+static CVReturn ip_cv_cb(CVDisplayLinkRef l, const CVTimeStamp *now, const CVTimeStamp *out, CVOptionFlags fi,
+                         CVOptionFlags *fo, void *ctx) {
+    (void)l, (void)now, (void)fi, (void)fo, (void)ctx;
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    static bool named;
+    if (!named) { named = true; pthread_setname_np("interp presenter"); }
+    uint64_t tp = out->hostTime * tb.numer / tb.denom;
+    uint64_t period = out->videoTimeScale ? (uint64_t)((double)out->videoRefreshPeriod * 1e9 / out->videoTimeScale) : 0;
+    if (period) atomic_store(&ip_period, period);
+    atomic_store(&ip_phase, tp);
+    atomic_store(&ip_last_cb, plat_now_ns());
+    if (!ip_wake_ns) { @autoreleasepool { ip_tick(tp); } return kCVReturnSuccess; }
+    pthread_mutex_lock(&ip_wake_mx);  // (the presenter's own thread does it, ip_wake_ns before the vsync)
+    ip_wake_tp = tp;
+    pthread_cond_signal(&ip_wake_cv);
+    pthread_mutex_unlock(&ip_wake_mx);
+    return kCVReturnSuccess;
+}
+
+// The display link asks ~12 ms ahead of a vsync; the presenter waits until ip_wake_ns before it and takes the newest
+// image then: images can be made that much later (less latency). LARECOMP_INTERP_WAKE_MS (default 4; 0: at once).
+static void *ip_presenter(void *arg) {
     (void)arg;
     pthread_setname_np("interp presenter");
-    plat_thread_guest(44);
-    if (@available(macOS 14.0, *)) {
-        @autoreleasepool {
-            ip_queue = [dev newCommandQueue];
-            static IpLinkDelegate *del;
-            del = [IpLinkDelegate new];
-            CAMetalDisplayLink *link = [[CAMetalDisplayLink alloc] initWithMetalLayer:layer];
-            link.delegate = del;
-            link.preferredFrameRateRange = CAFrameRateRangeMake(30, 240, 240);
-            link.preferredFrameLatency = (float)ip_latency;
-            [link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-            ip_link = link;
-            ip_loop = CFRunLoopGetCurrent();
-            CFRetain(ip_loop);
-        }
-        for (;;) @autoreleasepool { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false); }
+    plat_thread_realtime(8333333);
+    uint64_t done = 0;
+    for (;;) {
+        pthread_mutex_lock(&ip_wake_mx);
+        while (ip_wake_tp == done) pthread_cond_wait(&ip_wake_cv, &ip_wake_mx);
+        uint64_t tp = ip_wake_tp;
+        pthread_mutex_unlock(&ip_wake_mx);
+        done = tp;
+        if (tp > ip_wake_ns) plat_sleep_until_ns(tp - ip_wake_ns);
+        @autoreleasepool { ip_tick(tp); }
     }
     return NULL;
 }
 
-static void ip_set_paused(bool paused) {
-    if (!ip_loop) return;
-    if (@available(macOS 14.0, *)) {
-        CAMetalDisplayLink *link = ip_link;
-        CFRunLoopPerformBlock(ip_loop, kCFRunLoopDefaultMode, ^{ link.paused = paused; });
-        CFRunLoopWakeUp(ip_loop);
+static bool ip_link_start(void) {
+    if (!ip_cv) {
+        if (CVDisplayLinkCreateWithActiveCGDisplays(&ip_cv) != kCVReturnSuccess) { ip_cv = NULL; return false; }
+        CGDirectDisplayID disp = CGMainDisplayID();
+        NSWindow *w = (__bridge NSWindow *)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+        NSNumber *num = w.screen.deviceDescription[@"NSScreenNumber"];
+        if (num) disp = (CGDirectDisplayID)num.unsignedIntValue;
+        CVDisplayLinkSetCurrentCGDisplay(ip_cv, disp);
+        CVDisplayLinkSetOutputCallback(ip_cv, ip_cv_cb, NULL);
+        if (getenv("LARECOMP_INTERP_WAKE_MS")) ip_wake_ns = (uint64_t)(atof(getenv("LARECOMP_INTERP_WAKE_MS")) * 1e6);
+        if (ip_wake_ns) { pthread_t th; pthread_create(&th, NULL, ip_presenter, NULL); }
+        ip_queue = [dev newCommandQueue];
+        LOG("[interp] frame interpolation presenter: display %u, %.2f Hz\n", disp,
+            1.0 / fmax(CVDisplayLinkGetActualOutputVideoRefreshPeriod(ip_cv), 1e-3));
     }
+    return CVDisplayLinkStart(ip_cv) == kCVReturnSuccess || CVDisplayLinkIsRunning(ip_cv);
 }
+static void ip_link_stop(void) { if (ip_cv) CVDisplayLinkStop(ip_cv); }
+#pragma clang diagnostic pop
 
-// The presenter runs and shows slots: true once the display link calls (a hidden window's never does: the plain
-// present then).
+// The presenter runs and shows slots: true once its display link calls.
 static bool ip_start(void) {
-    if (@available(macOS 14.0, *)) {} else return false;
-    static bool started;
     uint64_t now = plat_now_ns();
-    if (!started) {
-        started = true;
-        if (getenv("LARECOMP_INTERP_LATENCY")) ip_latency = atof(getenv("LARECOMP_INTERP_LATENCY"));
-        pthread_t th;
-        pthread_create(&th, NULL, ip_thread, NULL);
-        LOG("[interp] frame interpolation presenter started\n");
-    }
     if (!atomic_load(&ip_on)) {
+        if (!ip_link_start()) {
+            static bool said;
+            if (!said) { said = true; LOG("[interp] no display link: frames shown without interpolation\n"); }
+            return false;
+        }
         slots_drop();
         ip_prev_stamp = 0;
         ip_on_since = now;
         atomic_store(&ip_on, true);
-        ip_set_paused(false);
+        LOG("[interp] frame interpolation on\n");
     }
     uint64_t last = atomic_load(&ip_last_cb);
-    bool alive = last && now - last < 250000000ull;
-    static bool said;
-    if (!alive && now - ip_on_since > 1000000000ull && !said) {
-        said = true;
-        LOG("[interp] the display link doesn't call (hidden window?): frames shown without interpolation\n");
-    }
-    if (alive) said = false;
-    return alive;
+    return last && last > ip_on_since && now - last < 250000000ull;
 }
 
 static void ip_stop(void) {
     if (!atomic_load(&ip_on)) return;
     atomic_store(&ip_on, false);
-    ip_set_paused(true);
+    ip_link_stop();
     LOG("[interp] frame interpolation off\n");
 }
 
@@ -1629,14 +1653,16 @@ static bool ip_present(NvnTexture *t, uint64_t frame, bool repeat) {
     if (!s0) blend = false;
     InterpShot sh[10];
     uint64_t per = atomic_load(&ip_period);
-    int n = interp_schedule(s0, s1, now, atomic_load(&ip_phase), per, (uint64_t)(ip_latency * (per ? per : 16666667)), blend, sh, 10);
+    int n = interp_schedule(s0, s1, now, atomic_load(&ip_phase), per, ip_wake_ns ? ip_wake_ns + 1000000 : (uint64_t)((ip_lead_ms > 0 ? ip_lead_ms : 33.3) * 1e6) + 1000000, blend, sh, 10);
     float rsx, rsy, rax = g_al_x, ray = g_al_y;  // (the scale this frame was drawn at: compose sets the next one's)
     renderer_get_scale(&rsx, &rsy);
+    int own = n - 1;  // (the game's own image: last when interpolating, first when extrapolating)
+    for (int i = 0; i < n; i++) if (sh[i].t == 1.0f) own = i;
     int gi = slot_claim(dw, dh, true);
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     if (gi >= 0) {
         compose(cb, t, sl_tex[gi], frame, true);
-        slot_commit(cb, gi, sh[n - 1].at, frame, K_GAME);
+        slot_commit(cb, gi, sh[own].at, frame, K_GAME);
     } else {
         static id<MTLTexture> spare;  // (no slot: the placement still has to be worked out)
         if (!spare || spare.width != dw || spare.height != dh) {
@@ -1651,14 +1677,14 @@ static bool ip_present(NvnTexture *t, uint64_t frame, bool repeat) {
     }
     present_tail(t, frame);
     int mids = 0;
-    for (int i = 0; i < n; i++) mids += sh[i].t < 1.0f;
+    for (int i = 0; i < n; i++) mids += sh[i].t != 1.0f;
     if (mids && interp_replay_lock()) {
         float nsx, nsy, nax = g_al_x, nay = g_al_y;
         renderer_get_scale(&nsx, &nsy);
         renderer_set_scale(rsx, rsy);
         renderer_set_alloc_scale(rax, ray);
         for (int i = 0; i < n; i++) {
-            if (sh[i].t >= 1.0f) continue;
+            if (sh[i].t == 1.0f) continue;
             int si = slot_claim(dw, dh, false);
             if (si < 0) { interp_note_skipped(); continue; }
             interp_prepare(sh[i].t);
@@ -1680,6 +1706,7 @@ static bool ip_present(NvnTexture *t, uint64_t frame, bool repeat) {
 // The GPU side of a present (the render thread when it's on, rqueue.c): the present pass, the overlay, shots.
 // frame: the number of this present (the game thread's frame when it was queued).
 void backend_present_now(NvnTexture *t, uint64_t frame) {
+    interp_latency_lag(frame, plat_now_ns());
     extern void renderer_submit(void);
     extern void renderer_texture_will_read(NvnTexture *t);
     renderer_texture_will_read(t);  // (a recorded clear of the image becomes its pass first)
@@ -1733,7 +1760,7 @@ void backend_present(NvnTexture *t) {
     g_last_presented = t;
     uint64_t frame = total_frames, t0 = plat_now_ns();
     extern volatile uint64_t g_vsync_ns;  // (runtime/hle/vi.c: the emulated vsync this frame was made in - frame interpolation)
-    interp_stamp(frame, g_vsync_ns ? g_vsync_ns : t0);
+    interp_stamp(frame, g_vsync_ns ? g_vsync_ns : t0, t0);
     if (rq_on()) rq_present(t, frame, true);
     else backend_present_now(t, frame);
     uint64_t t1 = plat_now_ns();

@@ -9,9 +9,10 @@
 // game's render-target objects and dynamic buffer addresses change every frame; this matched 96-100% of draws in
 // Mabe Village, Tail Cave, a door transition, a pit). Every uniform buffer of a matched draw is paired by position and
 // blended element-wise; integers (stored in float slots they read as denormals) never are. An element moving further
-// than the cut distance (+5% of its size: projection terms are large) is a jump - that buffer isn't blended; enough
-// of them in one frame (a camera cut, a warp), a level change, too few matches or a texture going away during the
-// frame make the whole frame a cut: no in-between images, the frame shows as it is.
+// than the cut distance (+5% of its size: projection terms are large) is a jump - it shows its new value at once (a
+// camera's settings switching as Link enters another part of the overworld: one value of its buffer). Jumps in most
+// of the buffers that changed (a camera cut, a warp), a level change, too few matches or a texture going away during
+// the frame make the whole frame a cut: no in-between images, the frame shows as it is.
 //
 //   LARECOMP_INTERP=on|measure|off   override the setting (measure: log and match only, no extra images)
 //   LARECOMP_INTERP_CUT=<d>          the jump distance (default 4 world units)
@@ -216,8 +217,15 @@ static _Atomic uint64_t s_gpu_n, s_compose_n;
 static uint64_t s_replays;
 static const char *const cut_name[6] = {"level/forced", "no previous frame", "few matches", "jumps", "object freed", "loading/hitch"};
 
-void interp_replay_gpu(double ms) { atomic_fetch_add(&s_gpu_n, 1); s_replay_gpu += ms; }  // (completion handlers: stats only)
-void interp_compose_gpu(double ms) { atomic_fetch_add(&s_compose_n, 1); s_compose_gpu += ms; }
+void interp_replay_gpu(double ms) {  // (completion handlers)
+    atomic_fetch_add(&s_gpu_n, 1);
+    s_replay_gpu += ms;
+}
+void interp_compose_gpu(double ms) {
+    atomic_fetch_add(&s_compose_n, 1);
+    s_compose_gpu += ms;
+}
+
 
 static void log_cut(int why, const char *more) {
     s_cuts[why]++;
@@ -260,10 +268,19 @@ bool interp_frame_end(bool log_next) {
             changed++;
             uint32_t nf = cc->size / 4;
             bool jump = false;  // (an element moved further than a frame's motion: a cut / teleport - no blend)
-            for (uint32_t q = 0; q < nf && !jump; q++)
+            uint32_t q = 0;
+            for (; q < nf && !jump; q++)
                 jump = blendable(a[q], b[q]) && fabsf(b[q] - a[q]) > cut + 0.05f * fmaxf(fabsf(a[q]), fabsf(b[q]));
-            if (jump) { cuts++; continue; }
-            cc->prev_off = pc->off;
+            if (jump) {
+                static int nlog;  // LARECOMP_INTERP_LOG_JUMPS=<frame>: log jumping buffers from that frame on
+                static long from = -1;
+                if (from < 0) from = getenv("LARECOMP_INTERP_LOG_JUMPS") ? atol(getenv("LARECOMP_INTERP_LOG_JUMPS")) : 0;
+                if (from && (long)s_frame_no >= from && nlog++ < 3000)
+                    LOG("[interp-jump] f%llu draw %u stage %d slot %d size %u elem %u: %g -> %g\n", (unsigned long long)s_frame_no,
+                        j, cc->stage, cc->slot, cc->size, q - 1, a[q - 1], b[q - 1]);
+                cuts++;
+            }
+            cc->prev_off = pc->off;  // (a jump: those elements show the new value, the rest blends)
         }
     }
     s_draws += cur->ndraws, s_matched += matched, s_changed += changed, s_cut_cbs += cuts, s_blended_cbs += changed - cuts;
@@ -274,7 +291,7 @@ bool interp_frame_end(bool log_next) {
         log_cut(2, why);
         return false;
     }
-    if (cuts > 8 && cuts * 5 > changed) {
+    if (cuts > 8 && cuts * 2 > changed) {  // (most of what moved jumped: a camera cut, a warp)
         snprintf(why, sizeof why, " (%llu of %llu changed buffers)", (unsigned long long)cuts, (unsigned long long)changed);
         log_cut(3, why);
         return false;
@@ -299,7 +316,10 @@ bool interp_prepare(float t) {
         const float *a = (const float *)(prev->bytes + cc->prev_off), *b = (const float *)(cur->bytes + cc->off);
         float *out = (float *)(blend_bytes + blend_n);
         uint32_t nf = cc->size / 4;
-        for (uint32_t q = 0; q < nf; q++) out[q] = blendable(a[q], b[q]) ? a[q] + (b[q] - a[q]) * t : b[q];
+        float cut = cut_threshold();
+        for (uint32_t q = 0; q < nf; q++)
+            out[q] = blendable(a[q], b[q]) && fabsf(b[q] - a[q]) <= cut + 0.05f * fmaxf(fabsf(a[q]), fabsf(b[q]))
+                   ? a[q] + (b[q] - a[q]) * t : b[q];
         memcpy((uint8_t *)out + nf * 4, (const uint8_t *)b + nf * 4, cc->size - nf * 4);
         cc->blend = (int64_t)blend_n;
         blend_n += (cc->size + 15) & ~15u;
@@ -348,7 +368,43 @@ void interp_frame_rotate(void) {
 
 // ---- the game's timeline
 static _Atomic uint64_t stamps[256];
-void interp_stamp(uint64_t frame, uint64_t vsync_ns) { atomic_store(&stamps[frame & 255], vsync_ns); }
+static _Atomic uint64_t called[256];
+void interp_stamp(uint64_t frame, uint64_t vsync_ns, uint64_t call_ns) {
+    atomic_store(&stamps[frame & 255], vsync_ns);
+    atomic_store(&called[frame & 255], call_ns);
+}
+
+// Latency (LARECOMP_INTERP_LOG period, with the option on or off): from the game's present call to its frame's own
+// image on screen (presented handlers), and to the render thread reaching that present.
+static pthread_mutex_t lat_mx = PTHREAD_MUTEX_INITIALIZER;
+static double lat_sum, lat_max, lag_sum, lat_t0;
+static uint64_t lat_n, lag_n;
+void interp_latency_lag(uint64_t frame, uint64_t now) {
+    uint64_t c = atomic_load(&called[frame & 255]);
+    if (!c || now < c) return;
+    pthread_mutex_lock(&lat_mx);
+    lag_sum += (now - c) / 1e6, lag_n++;
+    pthread_mutex_unlock(&lat_mx);
+}
+void interp_latency_shown(uint64_t frame, double presented_s, bool interp) {
+    uint64_t c = atomic_load(&called[frame & 255]);
+    if (!c || presented_s <= 0) return;
+    double ms = presented_s * 1e3 - c / 1e6;
+    if (ms < 0 || ms > 500) return;
+    pthread_mutex_lock(&lat_mx);
+    lat_sum += ms, lat_n++;
+    if (ms > lat_max) lat_max = ms;
+    double now = presented_s;
+    if (!lat_t0) lat_t0 = now;
+    static double every = -1;
+    if (every < 0) { const char *e = getenv("LARECOMP_INTERP_LOG"); every = e ? atof(e) : 2.0; }
+    if (every > 0 && now - lat_t0 >= every) {
+        LOG("[latency] frame interpolation %s: game present -> its image on screen %.1f ms avg, %.1f max (render thread "
+            "reached the present after %.1f ms)\n", interp ? "on" : "off", lat_sum / lat_n, lat_max, lag_n ? lag_sum / lag_n : 0);
+        lat_sum = lat_max = lag_sum = 0, lat_n = lag_n = 0, lat_t0 = now;
+    }
+    pthread_mutex_unlock(&lat_mx);
+}
 uint64_t interp_stamp_of(uint64_t frame) { return atomic_load(&stamps[frame & 255]); }
 
 // ---- scheduling
@@ -370,7 +426,9 @@ int interp_schedule(uint64_t s0u, uint64_t s1u, uint64_t nowu, uint64_t phaseu, 
     double per_image = 2.5e6;  // (render thread + GPU per in-between, generous: M3 Max ~1.5 + ~1.5 ms at 1080p)
     // (now: when an image made at once would be needed by the presenter; the first in-between can be due right
     // after s0 + L)
-    double need = blend ? now + 1e6 + per_image - s0 : now + 2e6 - s1;
+    static int extrap = -1;  // LARECOMP_INTERP_MODE=extrapolate: the frame at once, images after it from its motion
+    if (extrap < 0) { const char *e = getenv("LARECOMP_INTERP_MODE"); extrap = e && !strcmp(e, "extrapolate"); }
+    double need = blend && !extrap ? now + 1e6 + per_image - s0 : now + 2e6 - s1;
     win_need[win_i] = need;
     win_i = (win_i + 1) % 120;
     if (win_n < 120) win_n++;
@@ -392,6 +450,18 @@ int interp_schedule(uint64_t s0u, uint64_t s1u, uint64_t nowu, uint64_t phaseu, 
     }
     s_L += sched_L / 1e6;
     double start = s0 + sched_L, end = s1 + sched_L;
+    if (extrap) {  // own frame on the first vsync at s1 + L, then t = 1 .. 2 on the vsyncs until the next one is due
+        int n = 0;
+        double k = ceil((end - 0.25 * P - phase) / P), own = phase + k * P;
+        out[n++] = (InterpShot){(uint64_t)own, 1.0f};
+        for (double V = own + P; blend && V < own + D - 0.25 * P && n < max; V += P) {
+            if (V < now + 1e6) { s_late++; continue; }
+            out[n++] = (InterpShot){(uint64_t)V, (float)(1.0 + (V - own) / D)};
+        }
+        s_shots += (uint64_t)n;
+        s_mids += (uint64_t)(n - 1);
+        return n;
+    }
     if (last_at > start) start = last_at;  // (an image already placed there: the previous interval's own frame)
     int n = 0;
     double snap = 0.25 * P;

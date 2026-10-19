@@ -37,7 +37,9 @@ void interp_frame_rotate(void);           // after the present: this frame becom
 uint64_t interp_replay_salt(void);        // (renderer_exec_frame) a different "frame" for each replay
 
 // The game thread at each present: the emulated vsync this frame belongs to (its time on the game's timeline).
-void interp_stamp(uint64_t frame, uint64_t vsync_ns);
+void interp_stamp(uint64_t frame, uint64_t vsync_ns, uint64_t call_ns);
+void interp_latency_lag(uint64_t frame, uint64_t now);  // (render thread) it reached that frame's present
+void interp_latency_shown(uint64_t frame, double presented_s, bool interp);  // (presented handlers) its image is on screen
 uint64_t interp_stamp_of(uint64_t frame);
 
 // When to show what: the images for the game interval (s0, s1], placed on the display's vsync grid (phase + k * period)
