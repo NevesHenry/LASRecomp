@@ -754,8 +754,10 @@ static NvnTexture *g_last_presented;
 // Every game texture goes (the NvnTexture structs themselves are leaked: guest memory pointed at them), the
 // renderer drops what is keyed by guest addresses / objects, and the heap wrapper is let go: guest memory is
 // about to be replaced (backend_guest_memory_reset wraps the new pages).
+static void ip_stop(void);
 void backend_reset(void) {
     if (!queue) return;  // the game never initialised NVN
+    ip_stop();  // (frame interpolation's presenter: the start screen draws the window next)
     rq_drain();  // (the render thread: everything queued ran; it idles while the game is down)
     extern void renderer_reset(void);
     extern void renderer_flush(void);
@@ -778,6 +780,7 @@ void backend_guest_memory_reset(void) {
 // The window goes black while the game is down (instead of holding its last frame).
 void backend_clear_window(void) {
     if (!layer || !dev) return;
+    ip_stop();
     rq_drain();
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [layer nextDrawable];
@@ -1326,10 +1329,11 @@ static _Atomic bool ip_on;           // the presenter shows slots
 static _Atomic uint64_t ip_phase, ip_period, ip_last_cb;  // the display: a vsync's time, its period; the latest callback
 static uint64_t ip_on_since, ip_prev_stamp;
 static id<MTLCommandQueue> ip_queue;
-static uint64_t ip_wake_ns = 4000000, ip_wake_tp;
+static uint64_t ip_wake_ns = 6000000, ip_wake_tp;
 static pthread_mutex_t ip_wake_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ip_wake_cv = PTHREAD_COND_INITIALIZER;
-static double ip_lead_ms;  // (stats) how long before its vsync the presenter is asked for an image
+static double ip_lead_ms;
+static _Atomic int64_t ip_late_ns;  // how long after the vsync it was made for an image reaches the screen (smoothed)  // (stats) how long before its vsync the presenter is asked for an image
 
 // A slot for an image of w x h; force (the game's own frame): take the oldest one not on screen if none is free.
 static int slot_claim(NSUInteger w, NSUInteger h, bool force) {
@@ -1441,6 +1445,18 @@ static void ip_tick(uint64_t tp) {
     ip_lead_ms += ((tp > cb_now ? (tp - cb_now) / 1e6 : 0) - ip_lead_ms) * 0.02;
     if (!atomic_load(&ip_on)) return;
     double P = period ? (double)period : 16666667.0;
+    // The window's presents can queue up behind each other (seen: images on screen 1 to 4 vsyncs after the one they
+    // were made for, steady for a whole run): each vsync of that queue is latency. One vsync without a present lets
+    // it shrink by one - a single repeated image - until images reach the screen one vsync after theirs.
+    static int drain_wait;
+    if (drain_wait > 0) drain_wait--;
+    else if (atomic_load(&ip_late_ns) > 1.8 * P) {  // (a whole extra vsync, not single late images)
+        drain_wait = 60;
+        static int nlog;
+        if (nlog++ < 10) LOG("[interp] window presents %.1f ms behind: one vsync skipped\n", atomic_load(&ip_late_ns) / 1e6);
+        atomic_store(&ip_late_ns, (int64_t)P);
+        return;
+    }
     pthread_mutex_lock(&sl_mx);
     int best = -1;
     // the newest game frame's latest image that's due (a newer frame's images win over an older one's: a frame that
@@ -1536,6 +1552,10 @@ static void ip_tick(uint64_t tp) {
     double target_s = tp / 1e9;
     [drawable addPresentedHandler:^(id<MTLDrawable> d) {
         ip_presented(d.presentedTime, target_s, kind);
+        if (d.presentedTime > 0) {
+            int64_t late = (int64_t)((d.presentedTime - target_s) * 1e9), e = atomic_load(&ip_late_ns);
+            atomic_store(&ip_late_ns, e + (late - e) / 8);
+        }
         if (kind == K_GAME) interp_latency_shown(frame, d.presentedTime, true);
     }];
     // (at the vsync it was made for: presented as soon as drawn instead, half the images doubled up and the other half
@@ -1569,7 +1589,7 @@ static CVReturn ip_cv_cb(CVDisplayLinkRef l, const CVTimeStamp *now, const CVTim
 }
 
 // The display link asks ~12 ms ahead of a vsync; the presenter waits until ip_wake_ns before it and takes the newest
-// image then: images can be made that much later (less latency). LARECOMP_INTERP_WAKE_MS (default 4; 0: at once).
+// image then: images can be made that much later (less latency). LARECOMP_INTERP_WAKE_MS (default 6: 4 missed vsyncs now and then; 0: at once).
 static void *ip_presenter(void *arg) {
     (void)arg;
     pthread_setname_np("interp presenter");
@@ -1599,8 +1619,9 @@ static bool ip_link_start(void) {
         if (getenv("LARECOMP_INTERP_WAKE_MS")) ip_wake_ns = (uint64_t)(atof(getenv("LARECOMP_INTERP_WAKE_MS")) * 1e6);
         if (ip_wake_ns) { pthread_t th; pthread_create(&th, NULL, ip_presenter, NULL); }
         ip_queue = [dev newCommandQueue];
+        CVTime nominal = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(ip_cv);
         LOG("[interp] frame interpolation presenter: display %u, %.2f Hz\n", disp,
-            1.0 / fmax(CVDisplayLinkGetActualOutputVideoRefreshPeriod(ip_cv), 1e-3));
+            nominal.timeValue ? (double)nominal.timeScale / nominal.timeValue : 0.0);
     }
     return CVDisplayLinkStart(ip_cv) == kCVReturnSuccess || CVDisplayLinkIsRunning(ip_cv);
 }
@@ -1630,6 +1651,7 @@ static void ip_stop(void) {
     if (!atomic_load(&ip_on)) return;
     atomic_store(&ip_on, false);
     ip_link_stop();
+    slots_drop();
     LOG("[interp] frame interpolation off\n");
 }
 
