@@ -1,5 +1,6 @@
 // Executes recorded NVN command lists with Metal.
 #include <pthread.h>
+#include <stdatomic.h>
 #include <dirent.h>
 #include <unistd.h>
 #import <Metal/Metal.h>
@@ -292,6 +293,7 @@ static void end_pass(void) {
 }
 
 static void ring_reset(void);
+static void lag_attach(id<MTLCommandBuffer> c);
 // Submitted work runs asynchronously; last_cb is the most recently committed command buffer (the queue
 // executes in order, so waiting for it waits for everything before it). Other guest threads (nvnSyncWait)
 // read last_cb, so it is guarded by cb_lock; everything else here runs on the submitting thread.
@@ -429,6 +431,7 @@ void renderer_submit(void) {
     if (cmdbuf) {
         id<MTLCommandBuffer> c = cmdbuf;
         cmdbuf = nil;
+        lag_attach(c);
         [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
             stat_gpu_s += renderer_gpu_busy(done, false) / 1e9;
             if (done.error) LOG("[metal] command buffer error: %s\n", done.error.localizedDescription.UTF8String);
@@ -1013,9 +1016,54 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
 
 static void ring_reset(void) { ring_off = 0; }
 
+// (debug, LARECOMP_GPU_LAG_CHECK=1) guest memory the GPU reads in place (vertex / index buffers): each range's hash when
+// its draw is translated, hashed again when its command buffer completes. A change means the memory was written while
+// the GPU could still read it (by the CPU - or by the GPU itself: compare with a run without the GPU lag).
+typedef struct { uint64_t addr, size, hash; } LagRange;
+static LagRange *lag_r;
+static int lag_n, lag_cap, lag_check = -1;
+static _Atomic uint64_t lag_ranges, lag_changed, lag_bufs;
+static uint64_t range_hash(uint64_t addr, uint64_t size) {
+    const uint64_t *p = (const uint64_t *)(uintptr_t)(addr & ~7ull);
+    uint64_t n = size / 8, h = 1469598103934665603ull;
+    for (uint64_t i = 0; i < n; i += i < 8192 ? 1 : 512) h = (h ^ p[i]) * 1099511628211ull;  // (64 KB, then samples)
+    return h;
+}
+static void lag_note(uint64_t addr, uint64_t size) {
+    if (lag_check < 0) lag_check = getenv("LARECOMP_GPU_LAG_CHECK") != NULL;
+    if (!lag_check || size < 8) return;
+    for (int i = 0; i < lag_n; i++) if (lag_r[i].addr == addr && lag_r[i].size == size) return;
+    if (lag_n == lag_cap) { lag_cap = lag_cap ? lag_cap * 2 : 1024; lag_r = realloc(lag_r, sizeof *lag_r * (size_t)lag_cap); }
+    lag_r[lag_n++] = (LagRange){addr, size, range_hash(addr, size)};
+}
+static void lag_attach(id<MTLCommandBuffer> c) {
+    if (lag_check <= 0 || !lag_n) return;
+    int n = lag_n;
+    LagRange *r = malloc(sizeof *r * (size_t)n);
+    memcpy(r, lag_r, sizeof *r * (size_t)n);
+    lag_n = 0;
+    [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        uint64_t ch = 0;
+        for (int i = 0; i < n; i++)
+            if (range_hash(r[i].addr, r[i].size) != r[i].hash) {
+                ch++;
+                static _Atomic int said;
+                if (atomic_fetch_add(&said, 1) < 12) LOG("[lagcheck] changed in flight: %llx size %llu\n", r[i].addr, r[i].size);
+            }
+        free(r);
+        atomic_fetch_add(&lag_ranges, (uint64_t)n);
+        atomic_fetch_add(&lag_changed, ch);
+        if (atomic_fetch_add(&lag_bufs, 1) % 3000 == 2999)
+            LOG("[lagcheck] ranges checked %llu, changed in flight %llu\n", (unsigned long long)atomic_load(&lag_ranges),
+                (unsigned long long)atomic_load(&lag_changed));
+    }];
+}
+
 // Bind guest memory [addr, addr+size) as a buffer: zero-copy inside the heap, copied otherwise.
 static void bind_guest(id<MTLRenderCommandEncoder> e, bool vertex_stage, uint64_t addr, uint64_t size, int index) {
     if (addr >= HEAP_BASE && addr + size <= HEAP_BASE + HEAP_MAX && (addr & 3) == 0) {
+        lag_note(addr, size);
         if (vertex_stage) [e setVertexBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
         else [e setFragmentBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
         return;
@@ -2909,6 +2957,7 @@ static void draw(CmdRec *r, bool indexed) {
             uint64_t ioff;
             if (iaddr >= HEAP_BASE && iaddr + (uint64_t)count * isz <= HEAP_BASE + HEAP_MAX && (iaddr % isz) == 0) {
                 ib = g_guest_buffer; ioff = iaddr - HEAP_BASE;
+                lag_note(iaddr, (uint64_t)count * isz);
             } else {
                 ioff = ring_alloc((void *)(uintptr_t)iaddr, (uint64_t)count * isz); ib = ring;
             }
