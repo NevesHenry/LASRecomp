@@ -313,7 +313,7 @@ static id<MTLCommandBuffer> cb_hist[CB_HIST];
 // counter (Apple GPUs have no timestamps inside a buffer), and once that's done the counter gets the GPU's time
 // there: the end of the buffer before it, or the start of the one after it if the GPU sat idle in between. Until
 // then the host clock (the game waits on its fence before reading them; resolved after each wait). As vulkan/exec.c.
-// LARECOMP_MTL_COUNTER=cpu: the host clock only.
+// LARECOMP_MTL_COUNTER=cpu, or the GPU a frame behind (#67, nvn_gpu_lag): the host clock only.
 #define CTR_MAX 64
 static struct { uint64_t *out; const uint64_t *start; uint64_t before, after; } ctr_pend[CTR_MAX];
 static int nctr;
@@ -1016,25 +1016,34 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
 
 static void ring_reset(void) { ring_off = 0; }
 
-// (debug, LARECOMP_GPU_LAG_CHECK=1) guest memory the GPU reads in place (vertex / index buffers): each range's hash when
-// its draw is translated, hashed again when its command buffer completes. A change means the memory was written while
-// the GPU could still read it (by the CPU - or by the GPU itself: compare with a run without the GPU lag).
-typedef struct { uint64_t addr, size, hash; } LagRange;
+// (debug, LARECOMP_GPU_LAG_CHECK=1) guest memory the GPU uses in place (vertex / index buffers; storage buffers, which
+// shaders reach through gmem): each range's hash when its draw or dispatch is translated, hashed again when its command
+// buffer completes. A change means the memory was written while the GPU could still use it (by the CPU - or by the GPU
+// itself, as storage buffers often are: compare with a run with LARECOMP_GPU_LAG=0).
+enum { LAG_VTX, LAG_SSBO };
+typedef struct { uint64_t addr, size, hash; int kind; } LagRange;
 static LagRange *lag_r;
 static int lag_n, lag_cap, lag_check = -1;
-static _Atomic uint64_t lag_ranges, lag_changed, lag_bufs;
+static _Atomic uint64_t lag_ranges[2], lag_changed[2], lag_bufs;
 static uint64_t range_hash(uint64_t addr, uint64_t size) {
     const uint64_t *p = (const uint64_t *)(uintptr_t)(addr & ~7ull);
     uint64_t n = size / 8, h = 1469598103934665603ull;
     for (uint64_t i = 0; i < n; i += i < 8192 ? 1 : 512) h = (h ^ p[i]) * 1099511628211ull;  // (64 KB, then samples)
     return h;
 }
-static void lag_note(uint64_t addr, uint64_t size) {
+static void lag_note(uint64_t addr, uint64_t size, int kind) {
     if (lag_check < 0) lag_check = getenv("LARECOMP_GPU_LAG_CHECK") != NULL;
     if (!lag_check || size < 8) return;
     for (int i = 0; i < lag_n; i++) if (lag_r[i].addr == addr && lag_r[i].size == size) return;
     if (lag_n == lag_cap) { lag_cap = lag_cap ? lag_cap * 2 : 1024; lag_r = realloc(lag_r, sizeof *lag_r * (size_t)lag_cap); }
-    lag_r[lag_n++] = (LagRange){addr, size, range_hash(addr, size)};
+    lag_r[lag_n++] = (LagRange){addr, size, range_hash(addr, size), kind};
+}
+static void lag_note_sbufs(int stage) {  // (the storage buffers bound to a shader stage that uses gmem)
+    if (!lag_check) return;
+    for (int i = 0; i < 16; i++) {
+        uint64_t a = st.sbuf[stage][i].addr, n = st.sbuf[stage][i].size;
+        if (a >= HEAP_BASE && n && a + n <= HEAP_BASE + HEAP_MAX) lag_note(a, n, LAG_SSBO);
+    }
 }
 static void lag_attach(id<MTLCommandBuffer> c) {
     if (lag_check <= 0 || !lag_n) return;
@@ -1044,26 +1053,27 @@ static void lag_attach(id<MTLCommandBuffer> c) {
     lag_n = 0;
     [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
         (void)done;
-        uint64_t ch = 0;
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
+            atomic_fetch_add(&lag_ranges[r[i].kind], 1);
             if (range_hash(r[i].addr, r[i].size) != r[i].hash) {
-                ch++;
-                static _Atomic int said;
-                if (atomic_fetch_add(&said, 1) < 12) LOG("[lagcheck] changed in flight: %llx size %llu\n", r[i].addr, r[i].size);
+                atomic_fetch_add(&lag_changed[r[i].kind], 1);
+                static _Atomic int said[2];
+                if (atomic_fetch_add(&said[r[i].kind], 1) < 12)
+                    LOG("[lagcheck] changed in flight: %s %llx size %llu\n", r[i].kind ? "ssbo" : "vtx/idx", r[i].addr, r[i].size);
             }
+        }
         free(r);
-        atomic_fetch_add(&lag_ranges, (uint64_t)n);
-        atomic_fetch_add(&lag_changed, ch);
         if (atomic_fetch_add(&lag_bufs, 1) % 3000 == 2999)
-            LOG("[lagcheck] ranges checked %llu, changed in flight %llu\n", (unsigned long long)atomic_load(&lag_ranges),
-                (unsigned long long)atomic_load(&lag_changed));
+            LOG("[lagcheck] ranges checked %llu, changed in flight %llu; storage buffers checked %llu, changed %llu\n",
+                (unsigned long long)atomic_load(&lag_ranges[LAG_VTX]), (unsigned long long)atomic_load(&lag_changed[LAG_VTX]),
+                (unsigned long long)atomic_load(&lag_ranges[LAG_SSBO]), (unsigned long long)atomic_load(&lag_changed[LAG_SSBO]));
     }];
 }
 
 // Bind guest memory [addr, addr+size) as a buffer: zero-copy inside the heap, copied otherwise.
 static void bind_guest(id<MTLRenderCommandEncoder> e, bool vertex_stage, uint64_t addr, uint64_t size, int index) {
     if (addr >= HEAP_BASE && addr + size <= HEAP_BASE + HEAP_MAX && (addr & 3) == 0) {
-        lag_note(addr, size);
+        lag_note(addr, size, LAG_VTX);
         if (vertex_stage) [e setVertexBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
         else [e setFragmentBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
         return;
@@ -2154,7 +2164,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         [ce setBuffer:ring offset:off atIndex:k];
     }
     CST("gmem");
-    if (si->uses_gmem) [ce setBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+    if (si->uses_gmem) { [ce setBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_sbufs(5); }
     CST("textures");
     bool cmapped = si->ntex > MSL_MAX_SAMPLERS;
     __strong id<MTLSamplerState> msmp[64];
@@ -2744,7 +2754,7 @@ static void draw(CmdRec *r, bool indexed) {
     // resources
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
-    if (pr->vi->uses_gmem) [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+    if (pr->vi->uses_gmem) { [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_sbufs(0); }
     static id<MTLBuffer> dbgvs;
     bool dbg_this = maxwell_dbg_vs && (const uint8_t *)(uintptr_t)st.program->stages[0].code_addr == maxwell_dbg_vs;
     if (dbg_this) {
@@ -2752,7 +2762,7 @@ static void draw(CmdRec *r, bool indexed) {
         memset(dbgvs.contents, 0xff, 2 * 64 * 8 * 16);
         [enc setVertexBuffer:dbgvs offset:0 atIndex:DBG_VS_BUFFER_INDEX];
     }
-    if (pr->fi->uses_gmem) [enc setFragmentBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+    if (pr->fi->uses_gmem) { [enc setFragmentBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_sbufs(1); }
     bind_textures(0, pr->vi);
     bind_textures(1, pr->fi);
     extern bool pets_hide_item_cursor(void);  // (the cursor is on the companion card: runtime/hle/pets.c)
@@ -2957,7 +2967,7 @@ static void draw(CmdRec *r, bool indexed) {
             uint64_t ioff;
             if (iaddr >= HEAP_BASE && iaddr + (uint64_t)count * isz <= HEAP_BASE + HEAP_MAX && (iaddr % isz) == 0) {
                 ib = g_guest_buffer; ioff = iaddr - HEAP_BASE;
-                lag_note(iaddr, (uint64_t)count * isz);
+                lag_note(iaddr, (uint64_t)count * isz, LAG_VTX);
             } else {
                 ioff = ring_alloc((void *)(uintptr_t)iaddr, (uint64_t)count * isz); ib = ring;
             }
@@ -3527,7 +3537,13 @@ static void exec_list(uint64_t handle, int depth) {
             // (Switch GPU ticks, 614.4 MHz: the game converts the difference to ns itself - see the Vulkan exec.c)
             if (!out) break;
             static int gpu = -1;
-            if (gpu < 0) gpu = !(getenv("LARECOMP_MTL_COUNTER") && !strcmp(getenv("LARECOMP_MTL_COUNTER"), "cpu"));
+            if (gpu < 0) {
+                // With the GPU a frame behind (#67) a counter's GPU time is only sometimes resolved by the time the
+                // game reads it right after its fence wait, so the game would see a mix of GPU and host times: the
+                // host clock only then, and pace.c picks the 30 fps mode from frame times (as on CPU-bound machines).
+                extern bool nvn_gpu_lag(void);
+                gpu = !(getenv("LARECOMP_MTL_COUNTER") && !strcmp(getenv("LARECOMP_MTL_COUNTER"), "cpu")) && !nvn_gpu_lag();
+            }
             static uint64_t *prev_out;  // (frame pacing: the pair's start)
             out[0] = 0;
             out[1] = pace_end_counter(prev_out, out, ns_to_gpu_ticks(plat_now_ns()));

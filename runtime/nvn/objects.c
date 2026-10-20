@@ -1,5 +1,7 @@
 // NVN objects, builders, and state objects (everything except command recording).
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -167,6 +169,23 @@ NVN(nvnSyncInitialize) { SET_HOST(A(0), calloc(1, sizeof(NvnSync))); RET(1); }
 NVN(nvnSyncFinalize) { free(HOST(NvnSync, A(0))); SET_HOST(A(0), 0); }
 NVN(nvnSyncSetDebugLabel) { (void)c; }
 void renderer_flush(void);
+// The GPU may run one frame behind the game (#67, nvnSyncWait). LARECOMP_GPU_LAG=0/1; default on with Metal only.
+bool nvn_gpu_lag(void) {
+    static _Atomic int lag = -1;
+    int v = lag;
+    if (v < 0) {
+#ifdef __APPLE__
+        v = !getenv("LARECOMP_GPU_LAG") || atoi(getenv("LARECOMP_GPU_LAG"));
+#else
+        v = getenv("LARECOMP_GPU_LAG") && atoi(getenv("LARECOMP_GPU_LAG"));
+#endif
+        int was = -1;
+        if (atomic_compare_exchange_strong(&lag, &was, v))
+            LOG("[nvn] fence waits: %s\n", v ? "the GPU may run one frame behind" : "each waits for its own frame");
+    }
+    return v;
+}
+
 NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     static int flush = -1;
     static uint64_t n;
@@ -197,18 +216,9 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
         // CPU reads back from the GPU is finished during translation (copies to buffers flush, renderer.m), uniform
         // data is copied at translation, and the vertex / index memory the GPU reads in place showed no more writes
         // while in flight than without the lag (LARECOMP_GPU_LAG_CHECK). Same frame: 60 fps at 660-860 MHz. The game's
-        // timing counters resolve a frame later (pace.c keeps the 30 fps mode working from frame times).
+        // timing counters keep the host clock with the lag (renderer.m), so pace.c alone picks the 30 fps mode.
         // LARECOMP_GPU_LAG=0: wait for the frame itself (as before). Default on with Metal only.
-        static int lag = -1;
-        if (lag < 0) {
-#ifdef __APPLE__
-            lag = !getenv("LARECOMP_GPU_LAG") || atoi(getenv("LARECOMP_GPU_LAG"));
-#else
-            lag = getenv("LARECOMP_GPU_LAG") && atoi(getenv("LARECOMP_GPU_LAG"));
-#endif
-            LOG("[nvn] fence waits: %s\n", lag ? "the GPU may run one frame behind" : "each waits for its own frame");
-        }
-        if (lag && seq) {  // (the newest fence waited on and the one before it: every waiter of the newest gets the lag)
+        if (nvn_gpu_lag() && seq) {  // (the newest fence waited on and the one before it: every waiter of the newest gets the lag)
             static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
             static uint64_t newest, before;
             pthread_mutex_lock(&lk);
