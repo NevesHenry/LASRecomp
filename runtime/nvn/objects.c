@@ -188,6 +188,34 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             seq = rq_wait_item(seq);  // translated and submitted; then its GPU work
         }
         t0 = plat_now_ns();
+        // One frame on the GPU while the game records the next (#67). The game waits for its frame's fence right after
+        // presenting it, so its next frame's CPU work and that frame's GPU work never overlapped: a frame cost CPU + GPU,
+        // and once that passed 16.7 ms it fell to 30 fps with the GPU idle a third of the time - which macOS reads as
+        // a GPU to clock down (M3 Max 5120x2880 Match: 30 fps at 420 MHz; M1 2880x1800 Match: 30-40 fps, GPU ~45%
+        // busy). Now a wait for the newest fence waits for the GPU work of the fence waited on before it; its own list
+        // is already translated and submitted (rq_wait_item above), so the game's command memory is free. What the
+        // CPU reads back from the GPU is finished during translation (copies to buffers flush, renderer.m), uniform
+        // data is copied at translation, and the vertex / index memory the GPU reads in place showed no more writes
+        // while in flight than without the lag (LARECOMP_GPU_LAG_CHECK). Same frame: 60 fps at 660-860 MHz. The game's
+        // timing counters resolve a frame later (pace.c keeps the 30 fps mode working from frame times).
+        // LARECOMP_GPU_LAG=0: wait for the frame itself (as before). Default on with Metal only.
+        static int lag = -1;
+        if (lag < 0) {
+#ifdef __APPLE__
+            lag = !getenv("LARECOMP_GPU_LAG") || atoi(getenv("LARECOMP_GPU_LAG"));
+#else
+            lag = getenv("LARECOMP_GPU_LAG") && atoi(getenv("LARECOMP_GPU_LAG"));
+#endif
+            LOG("[nvn] fence waits: %s\n", lag ? "the GPU may run one frame behind" : "each waits for its own frame");
+        }
+        if (lag && seq) {  // (the newest fence waited on and the one before it: every waiter of the newest gets the lag)
+            static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+            static uint64_t newest, before;
+            pthread_mutex_lock(&lk);
+            if (seq > newest) before = newest, newest = seq;
+            if (seq > before) seq = before;
+            pthread_mutex_unlock(&lk);
+        }
         rq_watch("SyncWait: the GPU, submission", seq);
         renderer_wait_seq(seq);
         static long tr_at = -1;  // (debug, rqueue.c LARECOMP_RQ_TRACE) the game thread's fence waits in those frames
