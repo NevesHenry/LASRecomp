@@ -1049,7 +1049,7 @@ static void lag_note(uint64_t addr, uint64_t size, int kind) {
 // With the GPU running a frame behind, the game writes some small buffers for frame N + 2 while frame N may still be on
 // the GPU (LARECOMP_GPU_LAG_CHECK: a ping-pong pair of 8-byte storage buffers a compute shader reads, two floats
 // animating, changed in flight 17% of the time with the lag, never without; the same shader's four 3104-byte storage
-// buffers, ping-pong too, 4%). A buffer of at most GSNAP_RANGE_MAX bytes (a frame copies up to ~60 KB) that the
+// buffers, ping-pong too, 4%). A buffer of at most GSNAP_RANGE_MAX bytes that the
 // shader only reads is copied at translation, after the driver constants (c0, shader.h GSNAP), and its address in the
 // driver table points past the heap, where the shader's loads read that copy. Not for buffers a GPU store may reach:
 // the shader's own store targets (the translator traces each store to its table row - and a shader with a store it
@@ -1057,7 +1057,9 @@ static void lag_note(uint64_t addr, uint64_t size, int kind) {
 // translation would miss those writes): gs_gen, 256-byte granules marked per generation of submissions; a generation is
 // cleared for reuse only once its last submission has completed. Only with the lag (LARECOMP_GSNAP=0: off; =2: also
 // without the lag, a debug check with LARECOMP_GPU_LAG_CHECK).
-#define GSNAP_RANGE_MAX 4096
+// (compute up to 4 KB, where both ping-pong sets are; draws keep 256 bytes: per-pixel reads of KBs of constant data
+// are a cost not worth taking without a race found there)
+#define GSNAP_RANGE_MAX(stage) ((stage) == 5 ? 4096 : 256)
 #define GSNAP_MAX 16384  // (snapshot bytes per shader stage)
 #define GS_GENS 4
 static struct { uint64_t *bits, last_seq; uint32_t *touched; uint32_t ntouched, cap; } gs_gen[GS_GENS];
@@ -1135,7 +1137,7 @@ static uint32_t gsnap_stage(int stage, const ShaderInfo *si, uint32_t *drv, uint
     for (int i = 0; i < (stage == 5 ? 32 : 16); i++) {
         if (si->gmem_store_rows & (1u << i)) continue;
         Range r = gs_row(stage, i);
-        if (!gs_in_heap(r) || r.size > GSNAP_RANGE_MAX || gs_marked(r)) continue;
+        if (!gs_in_heap(r) || r.size > GSNAP_RANGE_MAX(stage) || gs_marked(r)) continue;
         if (n + r.size > GSNAP_MAX) continue;
         memcpy(gs_pack + n, (const void *)(uintptr_t)r.addr, r.size);
         uint64_t sa = HEAP_BASE + HEAP_MAX + n;
