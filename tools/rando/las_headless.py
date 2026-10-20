@@ -103,7 +103,7 @@ def default_settings(seed):
         'digs': False,  # digsanity: every diggable overworld tile is a check (tools/rando/digs.py)
         'hookshot-anything': False,  # the hookshot latches onto anything (tools/rando/hookshot_logic.py)
         'dungeon-room-shuffle': 'off',  # off / coherent / chaos / madness (tools/rando/dungeon_gen.py)
-        'passage-fog': 'off',  # (prototype, no UI) off / woods / tailor:<entry> / cloud (level_builder.py)
+        'passage-fog': 'off',  # (prototype, no UI) off / woods / tailor:<entry>[:<emitters>] / cloud (level_builder.py)
         'pet-rooster': False, 'pet-ghost': False, 'open-desert': True,  # pets (tools/rando/pets.py)
         'shopsanity': 'off', 'trendsanity': False,  # tools/rando/shopsanity.py (off / vanilla / random prices), trendsanity.py
         'triforce-hunt': 0, 'triforce-extra': 0,  # pieces needed (0 = off), extra % (tools/rando/triforce.py)
