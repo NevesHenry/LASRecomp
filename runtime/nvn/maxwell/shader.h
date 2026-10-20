@@ -79,10 +79,21 @@ typedef struct {
     uint32_t local_mem;     // bytes of local memory
     uint32_t num_insts;
     char error[256];        // set when translation fails
+    // (MSL) Storage buffer snapshots (renderer.m gsnap, with the GPU a frame behind): the driver-table rows (c0, 16 bytes
+    // each, from GSNAP_ROW0) whose address feeds a gmem store; any store through an address not traced to one makes
+    // gmem_store_unknown. gsnap: loads outside the heap read a snapshot appended to c0 (GSNAP_SIZE_OFF).
+    uint32_t gmem_store_rows;
+    bool gmem_store_unknown, gsnap;
 } ShaderInfo;
 
 // Global memory (LDG/STG) is addressed through one buffer that wraps the guest heap.
 #define GMEM_BUFFER_INDEX 17
+// (MSL) Snapshots of small storage buffers (renderer.m gsnap): a driver-table row may point past the heap, at
+// maxwell_gmem_base + maxwell_gmem_size + o; a load there reads word o of the snapshot data in c0 at GSNAP_SIZE_OFF + 16,
+// which holds GSNAP_SIZE_OFF.x bytes (0: none, the load reads 0 as before). The tables' first row and count, per stage.
+#define GSNAP_SIZE_OFF(stage) ((stage) == STAGE_COMPUTE ? 0x410u : 0x610u)
+#define GSNAP_ROW0(stage) ((stage) == STAGE_COMPUTE ? 0x21u : (stage) == STAGE_FRAGMENT ? 0x51u : 0x11u)
+#define GSNAP_ROWS(stage) ((stage) == STAGE_COMPUTE ? 32u : 16u)
 // (MSL) Metal's sampler slots a stage. A shader with more textures takes its samplers as an array of all the slots
 // and the slot of each texture from a table of uints at SMAP_BUFFER_INDEX (fragment, compute; [i] = texture i's slot).
 #define MSL_MAX_SAMPLERS 16
@@ -135,6 +146,9 @@ extern const uint8_t *maxwell_dbg_vs;
 #define DBG_VS_BUFFER_INDEX 29
 
 // code: shader binary (with the 0x50-byte SPH header for graphics stages)
+// (this thread's next maxwell_translate) the compiler constants' size when they follow the code at code + max_size (the
+// stage's const_offset), else 0: BRX jump tables are read there (gmem store analysis)
+extern __thread uint32_t maxwell_cb1_size;
 ShaderInfo *maxwell_translate(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key);
 void maxwell_free(ShaderInfo *s);
 // Disassemble for debugging (writes text to f).

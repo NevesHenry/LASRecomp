@@ -81,6 +81,7 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    bool gsnap_used;         // (MSL) a gmem load reads the snapshot past the heap (GSNAP)
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -1540,12 +1541,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     for (int k = 0; k < nw; k++)
                         sp(&c->body, "      if (ok) GMW(uint(ga >> 2) + %du, %s);\n", k, R(d == RZ ? RZ : d + k));
             }
-        } else if (!store) {
+        } else if (!store) {  // (outside the heap: a snapshot's words, shader.h GSNAP; 0 without one)
+            static const char *const gs_small[] = {
+                "(GSNAP(ga & ~3ul) >> (uint(ga & 3ul) * 8u)) & 0xFFu", "uint(int(char((GSNAP(ga & ~3ul) >> (uint(ga & 3ul) * 8u)) & 0xFFu)))",
+                "(GSNAP(ga & ~3ul) >> (uint(ga & 2ul) * 8u)) & 0xFFFFu", "uint(int(short((GSNAP(ga & ~3ul) >> (uint(ga & 2ul) * 8u)) & 0xFFFFu)))"};
+            c->gsnap_used = true;
             if (size < 4) {
-                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = ok ? %s : 0u;\n", d, ld_small[size]); }
+                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = ok ? %s : %s;\n", d, ld_small[size], gs_small[size]); }
             } else {
                 for (int k = 0; k < nw; k++)
-                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = ok ? *(device uint *)(gmem + ga + %du) : 0u;\n", d + k, k * 4); }
+                    if (d != RZ && d + k < RZ) {
+                        c->reg_used[d + k] = 1;
+                        sp(&c->body, "      r%d = ok ? *(device uint *)(gmem + ga + %du) : GSNAP(ga + %du);\n", d + k, k * 4, k * 4);
+                    }
             }
         } else {
             if (size == 0 || size == 1) sp(&c->body, "      if (ok) gmem[ga] = uchar(%s);\n", R(d));
@@ -2113,6 +2121,245 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     return info;
 }
 
+// Which driver-table rows (storage / uniform buffer addresses in c0) feed the address of each gmem store (STG), for the
+// renderer's snapshots of small buffers a shader only reads (shader.h GSNAP). A forward "may" dataflow over the code:
+// branches go to their target and on (BRX: the entries of the jump table it reads from the compiler constants, else
+// anywhere; SYNC / BRK / CONT: any SSY / PBK / PCNT target). Per register that
+// leads to a store address: the rows it may hold an address from - set by IADD / IADD3 / ISCADD / IADD32I / MOV / LDC
+// with a row of c0, carried by adding to a register that has rows (other operands taken as an index) - and whether it
+// may hold an address from anywhere else (a loaded pointer, any other write: loose). A store whose address may be loose
+// makes gmem_store_unknown (the renderer then takes no snapshots for the shader); otherwise its rows are store targets.
+#define GSR_MAX 64
+// Instructions that write no register (stores, barriers, flow control); and the second destination of TEXS / TLDS /
+// TLD4S (bits 28-35, -1 for anything else).
+static bool gsr_no_write(uint64_t w) {
+    uint64_t op = w >> 52, op13 = w >> 51;
+    return (op >= 0xe20 && op <= 0xe3f) || op13 == (0xeed8000000000000ull >> 51) || op13 == (0xef58000000000000ull >> 51) ||
+           op13 == (0xef50000000000000ull >> 51) || op13 == (0xeff0000000000000ull >> 51) || op13 == (0xf0f8000000000000ull >> 51) ||
+           op13 == (0xf0a8000000000000ull >> 51) || op13 == (0xef98000000000000ull >> 51) || op13 == (0xf0f0000000000000ull >> 51);
+}
+static int gsr_d1(uint64_t w) { return (w >> 60) == 0xd ? (int)bits(w, 28, 8) : -1; }
+// How many registers from bits 0-7 an instruction may write: none for predicate-only results (ISETP / FSETP / DSETP /
+// PSETP / CSETP / VSETP / R2P), two for doubles and conversions (may be 64-bit), four for texture, memory and anything
+// else not an ALU op, a load's size, one for the other ALU ops.
+static int gsr_nd(uint64_t w) {
+    if (gsr_no_write(w)) return 0;
+    uint64_t top = w >> 60;
+    if ((w & 0xfff8000000000000ull) == 0xeed0000000000000ull || (w & 0xfff8000000000000ull) == 0xef48000000000000ull ||
+        (w & 0xfff8000000000000ull) == 0xef40000000000000ull || (w & 0xfff8000000000000ull) == 0xef90000000000000ull) {
+        int sz = (int)bits(w, 48, 3);  // (LDG / LDS / LDL / LDC: 64 and 128-bit sizes write 2 / 4)
+        return sz == 5 ? 2 : sz >= 6 ? 4 : 1;
+    }
+    if (top >= 0x8) return 4;
+    // (16-bit opcode prefixes: register / constant forms 0x5c.. 0x4c.. compare 13 bits, immediate forms 0x38.. 0x36..
+    // without bit 56)
+    uint16_t o = (uint16_t)(w >> 48), r13 = o & 0xfff8, i13 = o & 0xfef8, r12 = o & 0xfff0, i12 = o & 0xfef0;
+    if (r12 == 0x5b60 || r12 == 0x4b60 || i12 == 0x3660 || r12 == 0x5bb0 || r12 == 0x4bb0 || i12 == 0x36b0 ||  // ISETP FSETP
+        r12 == 0x5b80 || r12 == 0x4b80 || i12 == 0x3680 || r13 == 0x5090 || r13 == 0x50a0 || r13 == 0x50f0 ||   // DSETP PSETP CSETP VSETP
+        r13 == 0x5cf0 || r13 == 0x4cf0 || i13 == 0x38f0)                                                       // R2P
+        return 0;
+    static const uint16_t two[] = {0x5c70, 0x4c70, 0x3870, 0x5c80, 0x4c80, 0x3880, 0x5b70, 0x4b70, 0x3670, 0x5370, 0x5c50,
+                                   0x4c50, 0x3850, 0x5ca8, 0x4ca8, 0x38a8, 0x5cb0, 0x4cb0, 0x38b0, 0x5cb8, 0x4cb8, 0x38b8,
+                                   0x5ce0, 0x4ce0, 0x38e0};  // DADD DMUL DFMA DMNMX F2F F2I I2F I2I
+    for (size_t k = 0; k < sizeof two / sizeof two[0]; k++)
+        if ((two[k] >> 12 == 0x3 ? i13 : r13) == two[k]) return 2;
+    return 1;
+}
+typedef struct { uint32_t rows[GSR_MAX]; uint64_t loose; } GsrState;
+static bool gsr_tracked(uint64_t w, int *src, int *nsrc, uint32_t *rowbits, int row0, int nrows) {
+    uint64_t top = w >> 60;
+    int a = (int)bits(w, 8, 8);
+    bool iadd = OPM(0x5c10000000000000ull, 0xfff8000000000000ull) || OPM(0x4c10000000000000ull, 0xfff8000000000000ull) ||
+                OPM(0x3810000000000000ull, 0xfef8000000000000ull);
+    bool iadd3 = OPM(0x5cc0000000000000ull, 0xfff0000000000000ull) || OPM(0x4cc0000000000000ull, 0xfff0000000000000ull) ||
+                 OPM(0x38c0000000000000ull, 0xfef0000000000000ull);
+    bool iscadd = OPM(0x5c18000000000000ull, 0xfff8000000000000ull) || OPM(0x4c18000000000000ull, 0xfff8000000000000ull) ||
+                  OPM(0x3818000000000000ull, 0xfef8000000000000ull);
+    bool mov = OPM(0x5c98000000000000ull, 0xfff8000000000000ull) || OPM(0x4c98000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3898000000000000ull, 0xfef8000000000000ull);
+#define TABLE_ROW(off) ((off) % 16 == 0 && (int)((off) >> 4) >= row0 && (int)((off) >> 4) < row0 + nrows ? 1u << ((int)((off) >> 4) - row0) : 0u)
+    *nsrc = 0, *rowbits = 0;
+    if (iadd || iadd3 || iscadd || mov) {
+        if (top == 0x4) { if (bits(w, 34, 5) == 0) *rowbits = TABLE_ROW(bits(w, 20, 14) * 4); }
+        else if (top == 0x5 && bits(w, 20, 8) != RZ) src[(*nsrc)++] = (int)bits(w, 20, 8);
+        if (!mov && !iscadd && a != RZ) src[(*nsrc)++] = a;  // (ISCADD: a is scaled, an index)
+        if (iadd3 && bits(w, 39, 8) != RZ) src[(*nsrc)++] = (int)bits(w, 39, 8);
+        return true;
+    }
+    if (OPM(0x1c00000000000000ull, 0xfe00000000000000ull)) {  // IADD32I
+        if (a != RZ) src[(*nsrc)++] = a;
+        return true;
+    }
+    if (OPM(0xef90000000000000ull, 0xfff8000000000000ull)) {  // LDC c0[imm]
+        if (bits(w, 36, 5) == 0 && a == RZ) *rowbits = TABLE_ROW(bits(w, 20, 16));
+        return true;
+    }
+#undef TABLE_ROW
+    return false;
+}
+__thread uint32_t maxwell_cb1_size;
+// BRX's targets: pc + 8 + Ra + imm with Ra loaded by the LDC c1[Rx + off] just before it (a jump table in the compiler
+// constants, which follow the code: cb1, cb1_size bytes). Every entry from off on that is a plausible target is taken
+// (one past the real table only adds targets). false: not that form.
+static bool brx_targets(const uint64_t *code, size_t end, size_t i, const uint8_t *tgt, const uint8_t *cb1, uint32_t cb1_size,
+                        uint8_t *out) {
+    uint64_t w = code[i];
+    int ra = (int)bits(w, 8, 8);
+    int64_t imm = sbits(w, 20, 24);
+    if (!cb1 || ra == RZ) return false;
+    size_t cur = i;
+    for (size_t j = i; j-- > 0;) {
+        if (j % 4 == 0) continue;
+        if (tgt[cur]) return false;  // (a path joins in between)
+        cur = j;
+        uint64_t v = code[j];
+        int d = (int)bits(v, 0, 8), d1 = gsr_d1(v);
+        bool ldc = (v & 0xfff8000000000000ull) == 0xef90000000000000ull;
+        if (ldc && d == ra) {
+            if (bits(v, 36, 5) != 1 || bits(v, 48, 3) >= 5) return false;
+            uint32_t off = (uint32_t)bits(v, 20, 16);
+            int n = 0;
+            for (uint32_t k = 0; k < 256 && off + 4 * k + 4 <= cb1_size; k++, n++) {
+                int32_t e;
+                memcpy(&e, cb1 + off + 4 * k, 4);
+                int64_t t = (int64_t)i * 8 + 8 + e + imm;
+                if (t < 0 || t % 8) break;
+                t = norm_target(t);
+                if ((size_t)(t / 8) >= end) break;
+                out[t / 8] = 1;
+            }
+            return n > 0;
+        }
+        if ((v >> 52) >= 0xe20 && (v >> 52) <= 0xe3f) return false;  // (flow in between)
+        if ((ra >= d && ra < d + gsr_nd(v)) || (d1 >= 0 && ra >= d1 && ra < d1 + 4)) return false;  // (written some other way)
+    }
+    return false;
+}
+
+static void gmem_store_rows(Ctx *c, const uint64_t *code, size_t end, const uint8_t *cb1, uint32_t cb1_size) {
+    ShaderInfo *info = c->info;
+    int stage = c->stage;
+    bool any_store = false;
+    for (size_t i = 0; i < end; i++)
+        if (i % 4 && (code[i] & 0xfff8000000000000ull) == 0xeed8000000000000ull) any_store = true;
+    if (!any_store) return;
+    if (stage != STAGE_VERTEX && stage != STAGE_FRAGMENT && stage != STAGE_COMPUTE) { info->gmem_store_unknown = true; return; }
+    int row0 = (int)GSNAP_ROW0(stage), nrows = (int)GSNAP_ROWS(stage);
+    // the registers that lead to store addresses (compact indices)
+    int16_t idx[256];
+    memset(idx, 0xff, sizeof idx);
+    int nreg = 0;
+    for (size_t i = 0; i < end; i++) {
+        uint64_t w = code[i];
+        if (i % 4 == 0 || (w & 0xfff8000000000000ull) != 0xeed8000000000000ull) continue;
+        int a = (int)bits(w, 8, 8);
+        if (a == RZ) { info->gmem_store_unknown = true; return; }
+        if (idx[a] < 0) { if (nreg == GSR_MAX) { info->gmem_store_unknown = true; return; } idx[a] = (int16_t)nreg++; }
+    }
+    for (bool more = true; more;) {
+        more = false;
+        for (size_t i = 0; i < end; i++) {
+            uint64_t w = code[i];
+            int src[3], ns, d = (int)bits(w, 0, 8);
+            uint32_t rb;
+            if (i % 4 == 0 || d == RZ || idx[d] < 0 || !gsr_tracked(w, src, &ns, &rb, row0, nrows)) continue;
+            for (int k = 0; k < ns; k++)
+                if (idx[src[k]] < 0) {
+                    if (nreg == GSR_MAX) { info->gmem_store_unknown = true; return; }
+                    idx[src[k]] = (int16_t)nreg++, more = true;
+                }
+        }
+    }
+    // successors beyond the next instruction: branch targets (tgt), SSY / PBK / PCNT targets (sync_target), BRX's
+    uint8_t *sync_target = calloc(end + 4, 1), *tgt = calloc(end + 4, 1), *brx_tgt = calloc(end + 4, 1);
+    bool brx = false;
+    for (size_t i = 0; i < end; i++) {
+        uint64_t w = code[i], op = w >> 52;
+        if (i % 4 == 0) continue;
+        if (op == 0xe20 || op == 0xe21 || op == 0xe22 || op == 0xe26) {
+            info->gmem_store_unknown = true;
+            free(sync_target), free(tgt), free(brx_tgt);
+            return;
+        }
+        if (op == 0xe24 || op == 0xe29 || op == 0xe2a || op == 0xe2b) {
+            int64_t t = norm_target((int64_t)i * 8 + 8 + sbits(w, 20, 24));
+            if (t >= 0 && (size_t)(t / 8) < end) tgt[t / 8] = 1;
+            if (op != 0xe24 && t >= 0 && (size_t)(t / 8) < end) sync_target[t / 8] = 1;
+        }
+    }
+    for (size_t i = 0; i < end; i++) {
+        if (i % 4 == 0 || (code[i] >> 52) != 0xe25) continue;
+        brx = true;
+        if (!brx_targets(code, end, i, tgt, cb1, cb1_size, brx_tgt)) memset(brx_tgt, 1, end);  // (anywhere)
+    }
+    GsrState *in = calloc(end + 1, sizeof *in);  // (entry: every register 0 - no address in the heap)
+    GsrState any;  // (the union of the states BRX / SYNC / BRK / CONT leave: they may reach every target)
+    GsrState jump;
+    memset(&any, 0, sizeof any);
+    memset(&jump, 0, sizeof jump);
+    for (bool more = true; more;) {
+        more = false;
+        for (size_t i = 0; i < end; i++) {
+            if (i % 4 == 0) continue;
+            uint64_t w = code[i], op = w >> 52;
+            GsrState s = in[i];
+            if (brx && brx_tgt[i]) { for (int r = 0; r < nreg; r++) s.rows[r] |= any.rows[r]; s.loose |= any.loose; }
+            if (sync_target[i]) { for (int r = 0; r < nreg; r++) s.rows[r] |= jump.rows[r]; s.loose |= jump.loose; }
+            // transfer
+            bool pred = bits(w, 16, 3) != 7 || bits(w, 19, 1);
+            int src[3], ns, d = (int)bits(w, 0, 8);
+            uint32_t rb;
+            if (gsr_no_write(w)) {
+            } else if (gsr_tracked(w, src, &ns, &rb, row0, nrows)) {
+                if (d != RZ && idx[d] >= 0) {
+                    uint32_t t = rb;
+                    for (int k = 0; k < ns; k++) t |= s.rows[idx[src[k]]];
+                    int r = idx[d];
+                    if (pred) s.rows[r] |= t; else s.rows[r] = t;
+                    if (!t) s.loose |= 1ull << r;
+                    else if (!pred) s.loose &= ~(1ull << r);
+                }
+                for (int k = 1; k < gsr_nd(w) && d + k < RZ; k++)  // (LDC.64: the high word holds no row)
+                    if (idx[d + k] >= 0) { if (!pred) s.rows[idx[d + k]] = 0; s.loose |= 1ull << idx[d + k]; }
+            } else {
+                int d1 = gsr_d1(w), n = gsr_nd(w);
+                for (int k = 0; k < 4; k++) {
+                    if (k < n && d + k < RZ && idx[d + k] >= 0) { if (!pred) s.rows[idx[d + k]] = 0; s.loose |= 1ull << idx[d + k]; }
+                    if (d1 >= 0 && d1 + k < RZ && idx[d1 + k] >= 0) { if (!pred) s.rows[idx[d1 + k]] = 0; s.loose |= 1ull << idx[d1 + k]; }
+                }
+            }
+            // successors: the next instruction (always: conditions aren't followed), branch targets, the jump sets
+            size_t nx = i + 1 + ((i + 1) % 4 == 0);
+            GsrState *outs[3] = {nx < end ? &in[nx] : NULL, NULL, NULL};
+            if (op == 0xe24) {
+                int64_t t = norm_target((int64_t)i * 8 + 8 + sbits(w, 20, 24));
+                if (t >= 0 && (size_t)(t / 8) < end) outs[1] = &in[t / 8];
+            }
+            if (op == 0xe25 || (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || op == 0xe34 || op == 0xe35)
+                outs[2] = op == 0xe25 ? &any : &jump;
+            for (int k = 0; k < 3; k++) {
+                GsrState *o = outs[k];
+                if (!o) continue;
+                for (int r = 0; r < nreg; r++)
+                    if ((o->rows[r] | s.rows[r]) != o->rows[r]) o->rows[r] |= s.rows[r], more = true;
+                if ((o->loose | s.loose) != o->loose) o->loose |= s.loose, more = true;
+            }
+        }
+    }
+    for (size_t i = 0; i < end; i++) {
+        uint64_t w = code[i];
+        if (i % 4 == 0 || (w & 0xfff8000000000000ull) != 0xeed8000000000000ull) continue;
+        GsrState s = in[i];
+        if (brx && brx_tgt[i]) { for (int r = 0; r < nreg; r++) s.rows[r] |= any.rows[r]; s.loose |= any.loose; }
+        if (sync_target[i]) { for (int r = 0; r < nreg; r++) s.rows[r] |= jump.rows[r]; s.loose |= jump.loose; }
+        int r = idx[bits(w, 8, 8)];
+        if (s.loose & (1ull << r)) info->gmem_store_unknown = true;
+        info->gmem_store_rows |= s.rows[r];
+    }
+    free(in);
+    free(sync_target), free(tgt), free(brx_tgt);
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2167,6 +2414,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
         (void)is_branch_target_op;
     }
+    if (!c->glsl) gmem_store_rows(c, (const uint64_t *)code, end, maxwell_cb1_size ? blob + max_size : NULL, maxwell_cb1_size);
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;
@@ -2192,6 +2440,14 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         fail(c, "%d textures in a vertex shader (Metal: %d samplers)", info->ntex, MSL_MAX_SAMPLERS);
     if (c->fail) { free(c->body.buf); free(c); return info; }
     if (c->glsl) return glsl_finish(c, any_branch, dbg);
+    // snapshots (GSNAP): only where the shader's own c0 reads end before the snapshot's size word and every store's
+    // buffer is known (the renderer leaves those unsnapshotted)
+    if (c->gsnap_used && !info->gmem_store_unknown && !(info->cbuf_dynamic & 1) && c->cbuf_need[0] <= GSNAP_SIZE_OFF(stage) >> 4 &&
+        (stage == STAGE_VERTEX || stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE)) {
+        char cb[64];
+        cbuf_ref(c, 0, GSNAP_SIZE_OFF(stage), NULL, cb);
+        info->gsnap = true;
+    }
 
     // ---------------------------------------------------------- MSL source
     Str s = {0};
@@ -2208,6 +2464,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     // (old & 0xFFFF0000u) | lo in Link's body shader - the merged low half read back as a constant 512.0 and Link
     // rendered white. Same bits either way.
     sp(&s, "static inline uint hpack(float2 r, uint merge, uint old) { if (merge == 1u) return as_type<uint>(r.x); half2 o = as_type<half2>(old), n = half2(r); if (merge == 2u) o.x = n.x; else if (merge == 3u) o.y = n.y; else o = n; return as_type<uint>(o); }\n");
+    if (info->gsnap)
+        sp(&s, "static inline uint gsnap_w(constant uint4 *cb, ulong g) { uint n = cb[%u].x; return g < ulong(n) ? "
+               "cb[%uu + uint(g >> 4)][uint(g >> 2) & 3u] : 0u; }\n#define GSNAP(g) gsnap_w(cb0, (g) - 0x%llxul)\n",
+           GSNAP_SIZE_OFF(stage) >> 4, (GSNAP_SIZE_OFF(stage) >> 4) + 1, (unsigned long long)maxwell_gmem_size);
+    else if (c->gsnap_used) sp(&s, "#define GSNAP(g) 0u\n");
     sp(&s, "static inline uint prmt(uint a, uint b, uint sel) { uint r = 0; for (uint i = 0; i < 4; i++) { uint s = (sel >> (i * 4)) & 7u; uint byte = s < 4 ? (a >> (s * 8)) & 0xFFu : (b >> ((s - 4) * 8)) & 0xFFu; r |= byte << (i * 8); } return r; }\n");
 
     // inputs/outputs

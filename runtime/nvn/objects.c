@@ -214,9 +214,11 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
         // busy). Now a wait for the newest fence waits for the GPU work of the fence waited on before it; its own list
         // is already translated and submitted (rq_wait_item above), so the game's command memory is free. What the
         // CPU reads back from the GPU is finished during translation (copies to buffers flush, renderer.m), uniform
-        // data is copied at translation, and the vertex / index memory the GPU reads in place showed no more writes
-        // while in flight than without the lag (LARECOMP_GPU_LAG_CHECK). Same frame: 60 fps at 660-860 MHz. The game's
-        // timing counters keep the host clock with the lag (renderer.m), so pace.c alone picks the 30 fps mode.
+        // data is copied at translation, small buffers shaders only read through gmem too (renderer.m gsnap: the game
+        // rewrites some for frame N + 2 while frame N may still be on the GPU), and the vertex / index memory the GPU reads
+        // in place showed no more writes while in flight than without the lag (LARECOMP_GPU_LAG_CHECK). Same frame: 60 fps
+        // at 660-860 MHz. The game's timing counters keep the host clock with the lag (renderer.m), so pace.c alone picks
+        // the 30 fps mode.
         // LARECOMP_GPU_LAG=0: wait for the frame itself (as before). Default on with Metal only.
         if (nvn_gpu_lag() && seq) {  // (the newest fence waited on and the one before it: every waiter of the newest gets the lag)
             static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;

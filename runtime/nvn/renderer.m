@@ -294,6 +294,7 @@ static void end_pass(void) {
 
 static void ring_reset(void);
 static void lag_attach(id<MTLCommandBuffer> c);
+static void gs_rotate(void);
 // Submitted work runs asynchronously; last_cb is the most recently committed command buffer (the queue
 // executes in order, so waiting for it waits for everything before it). Other guest threads (nvnSyncWait)
 // read last_cb, so it is guarded by cb_lock; everything else here runs on the submitting thread.
@@ -432,6 +433,7 @@ void renderer_submit(void) {
         id<MTLCommandBuffer> c = cmdbuf;
         cmdbuf = nil;
         lag_attach(c);
+        gs_rotate();
         [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
             stat_gpu_s += renderer_gpu_busy(done, false) / 1e9;
             if (done.error) LOG("[metal] command buffer error: %s\n", done.error.localizedDescription.UTF8String);
@@ -1020,11 +1022,12 @@ static void ring_reset(void) { ring_off = 0; }
 // shaders reach through gmem): each range's hash when its draw or dispatch is translated, hashed again when its command
 // buffer completes. A change means the memory was written while the GPU could still use it (by the CPU - or by the GPU
 // itself, as storage buffers often are: compare with a run with LARECOMP_GPU_LAG=0).
+// Storage / uniform buffers a shader reads through a snapshot (gsnap below) aren't read in place: counted apart.
 enum { LAG_VTX, LAG_SSBO };
 typedef struct { uint64_t addr, size, hash; int kind; } LagRange;
 static LagRange *lag_r;
 static int lag_n, lag_cap, lag_check = -1;
-static _Atomic uint64_t lag_ranges[2], lag_changed[2], lag_bufs;
+static _Atomic uint64_t lag_ranges[2], lag_changed[2], lag_bufs, lag_snapped;
 static uint64_t range_hash(uint64_t addr, uint64_t size) {
     const uint64_t *p = (const uint64_t *)(uintptr_t)(addr & ~7ull);
     uint64_t n = size / 8, h = 1469598103934665603ull;
@@ -1038,11 +1041,125 @@ static void lag_note(uint64_t addr, uint64_t size, int kind) {
     if (lag_n == lag_cap) { lag_cap = lag_cap ? lag_cap * 2 : 1024; lag_r = realloc(lag_r, sizeof *lag_r * (size_t)lag_cap); }
     lag_r[lag_n++] = (LagRange){addr, size, range_hash(addr, size), kind};
 }
-static void lag_note_sbufs(int stage) {  // (the storage buffers bound to a shader stage that uses gmem)
+
+// ---- snapshots of small buffers shaders read through gmem (#67: the GPU a frame behind)
+// With the GPU running a frame behind, the game writes some small buffers for frame N + 2 while frame N may still be on
+// the GPU (a ping-pong pair of 8-byte storage buffers a compute shader reads, two floats animating: changed in flight 17%
+// of the time with the lag, never without - LARECOMP_GPU_LAG_CHECK). A buffer of at most GSNAP_RANGE_MAX bytes that the
+// shader only reads is copied at translation, after the driver constants (c0, shader.h GSNAP), and its address in the
+// driver table points past the heap, where the shader's loads read that copy. Not for buffers a GPU store may reach:
+// the shader's own store targets (the translator traces each store to its table row - and a shader with a store it
+// can't trace takes no snapshots), and anything a shader stored to in work that may still be in flight (a copy taken at
+// translation would miss those writes): gs_gen, 256-byte granules marked per generation of submissions; a generation is
+// cleared for reuse only once its last submission has completed. Only with the lag (LARECOMP_GSNAP=0: off).
+#define GSNAP_RANGE_MAX 256
+#define GSNAP_MAX 4096  // (snapshot bytes per shader stage)
+#define GS_GENS 4
+static struct { uint64_t *bits, last_seq; uint32_t *touched; uint32_t ntouched, cap; } gs_gen[GS_GENS];
+static int gs_cur;
+static bool gsnap_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern bool nvn_gpu_lag(void);
+        on = nvn_gpu_lag() && (!getenv("LARECOMP_GSNAP") || atoi(getenv("LARECOMP_GSNAP")));
+        for (int g = 0; on && g < GS_GENS; g++)
+            if (!(gs_gen[g].bits = calloc(HEAP_MAX / 256 / 64 + 1, sizeof(uint64_t)))) on = 0;
+        LOG("[metal] small buffers read through gmem: %s\n", on ? "snapshots while the GPU runs a frame behind" : "in place");
+    }
+    return on;
+}
+static bool gs_seq_done(uint64_t seq) {  // (render thread)
+    if (seq > submit_seq) return false;
+    if (submit_seq - seq >= CB_HIST) return true;
+    pthread_mutex_lock(&cb_lock);
+    id<MTLCommandBuffer> c = cb_hist[seq % CB_HIST];
+    pthread_mutex_unlock(&cb_lock);
+    return !c || c.status >= MTLCommandBufferStatusCompleted;
+}
+// After a submission: marks go to the next generation once its last submission is done (it's cleared first).
+static void gs_rotate(void) {
+    if (!gs_gen[0].bits || !gs_gen[gs_cur].ntouched) return;
+    int n = (gs_cur + 1) % GS_GENS;
+    if (gs_gen[n].ntouched && !gs_seq_done(gs_gen[n].last_seq)) return;
+    for (uint32_t k = 0; k < gs_gen[n].ntouched; k++) gs_gen[n].bits[gs_gen[n].touched[k]] = 0;
+    gs_gen[n].ntouched = 0;
+    gs_cur = n;
+}
+static Range gs_row(int stage, int i) {  // (row i of a stage's table: compute uniform buffers 0-15, storage 16-31)
+    if (stage == 5) return i < 16 ? st.ubuf[5][i] : st.sbuf[5][i - 16];
+    return st.sbuf[stage][i];
+}
+static bool gs_in_heap(Range r) { return r.addr >= HEAP_BASE && r.size && r.addr + r.size <= HEAP_BASE + HEAP_MAX; }
+static void gs_mark_stores(int stage, const ShaderInfo *si) {  // (before any snapshot of the draw / dispatch)
+    if (!si || !si->uses_gmem || (!si->gmem_store_rows && !si->gmem_store_unknown) || !gsnap_on()) return;
+    for (int i = 0; i < (stage == 5 ? 32 : 16); i++) {
+        if (!si->gmem_store_unknown && !(si->gmem_store_rows & (1u << i))) continue;
+        Range r = gs_row(stage, i);
+        if (!gs_in_heap(r)) continue;
+        typeof(gs_gen[0]) *G = &gs_gen[gs_cur];
+        G->last_seq = submit_seq + 1;  // (the command buffer being recorded)
+        uint64_t g0 = (r.addr - HEAP_BASE) >> 8, g1 = (r.addr - HEAP_BASE + r.size - 1) >> 8;
+        for (uint64_t g = g0; g <= g1; g++) {
+            uint64_t *wd = &G->bits[g >> 6];
+            if (!*wd) {
+                if (G->ntouched == G->cap) G->cap = G->cap ? G->cap * 2 : 4096, G->touched = realloc(G->touched, G->cap * sizeof *G->touched);
+                G->touched[G->ntouched++] = (uint32_t)(g >> 6);
+            }
+            if (!(g & 63) && g + 63 <= g1) { *wd = ~0ull; g += 63; continue; }
+            *wd |= 1ull << (g & 63);
+        }
+    }
+}
+static bool gs_marked(Range r) {
+    uint64_t g0 = (r.addr - HEAP_BASE) >> 8, g1 = (r.addr - HEAP_BASE + r.size - 1) >> 8;
+    for (int k = 0; k < GS_GENS; k++) {
+        if (!gs_gen[k].ntouched) continue;
+        for (uint64_t g = g0; g <= g1; g++) if (gs_gen[k].bits[g >> 6] & (1ull << (g & 63))) return true;
+    }
+    return false;
+}
+// Snapshots for a stage's table (drv: the driver constants, the table's row 0 at byte `base`): rewrites the addresses,
+// returns the copies' size (in gs_pack) and the rows done.
+static uint8_t gs_pack[GSNAP_MAX];
+static uint32_t gsnap_stage(int stage, const ShaderInfo *si, uint32_t *drv, uint32_t base, uint32_t *rows) {
+    *rows = 0;
+    if (!si->gsnap || !gsnap_on()) return 0;
+    uint32_t n = 0;
+    for (int i = 0; i < (stage == 5 ? 32 : 16); i++) {
+        if (si->gmem_store_rows & (1u << i)) continue;
+        Range r = gs_row(stage, i);
+        if (!gs_in_heap(r) || r.size > GSNAP_RANGE_MAX || gs_marked(r)) continue;
+        if (n + r.size > GSNAP_MAX) break;
+        memcpy(gs_pack + n, (const void *)(uintptr_t)r.addr, r.size);
+        uint64_t sa = HEAP_BASE + HEAP_MAX + n;
+        uint32_t *e = &drv[(base + 16 * i) / 4];
+        e[0] = (uint32_t)sa, e[1] = (uint32_t)(sa >> 32);
+        *rows |= 1u << i;
+        n = (n + (uint32_t)r.size + 15) & ~15u;
+    }
+    return n;
+}
+// The driver constants to bind: drv's first `size` bytes, plus the snapshots (n bytes in gs_pack) after the size word.
+static uint64_t gsnap_alloc(int stage, const uint32_t *drv, uint64_t size, uint32_t n) {
+    if (!n) return ring_alloc(drv, size);
+    static uint8_t buf[0x800 + 16 + GSNAP_MAX];
+    uint32_t so = GSNAP_SIZE_OFF(stage == 5 ? STAGE_COMPUTE : STAGE_VERTEX);
+    uint64_t total = so + 16 + n > size ? so + 16 + n : size;
+    memset(buf, 0, total);
+    memcpy(buf, drv, so < size ? so : size);
+    memcpy(buf + so, &n, 4);
+    memcpy(buf + so + 16, gs_pack, n);
+    return ring_alloc(buf, total);
+}
+
+// (debug) the storage / uniform buffers bound to a shader stage that uses gmem; rows read through snapshots apart
+static void lag_note_rows(int stage, uint32_t snapped) {
     if (!lag_check) return;
-    for (int i = 0; i < 16; i++) {
-        uint64_t a = st.sbuf[stage][i].addr, n = st.sbuf[stage][i].size;
-        if (a >= HEAP_BASE && n && a + n <= HEAP_BASE + HEAP_MAX) lag_note(a, n, LAG_SSBO);
+    for (int i = 0; i < (stage == 5 ? 32 : 16); i++) {
+        Range r = gs_row(stage, i);
+        if (!gs_in_heap(r)) continue;
+        if (snapped & (1u << i)) atomic_fetch_add(&lag_snapped, 1);
+        else lag_note(r.addr, r.size, LAG_SSBO);
     }
 }
 static void lag_attach(id<MTLCommandBuffer> c) {
@@ -1064,9 +1181,11 @@ static void lag_attach(id<MTLCommandBuffer> c) {
         }
         free(r);
         if (atomic_fetch_add(&lag_bufs, 1) % 3000 == 2999)
-            LOG("[lagcheck] ranges checked %llu, changed in flight %llu; storage buffers checked %llu, changed %llu\n",
+            LOG("[lagcheck] ranges checked %llu, changed in flight %llu; storage buffers checked %llu, changed %llu "
+                "(snapshots %llu)\n",
                 (unsigned long long)atomic_load(&lag_ranges[LAG_VTX]), (unsigned long long)atomic_load(&lag_changed[LAG_VTX]),
-                (unsigned long long)atomic_load(&lag_ranges[LAG_SSBO]), (unsigned long long)atomic_load(&lag_changed[LAG_SSBO]));
+                (unsigned long long)atomic_load(&lag_ranges[LAG_SSBO]), (unsigned long long)atomic_load(&lag_changed[LAG_SSBO]),
+                (unsigned long long)atomic_load(&lag_snapped));
     }];
 }
 
@@ -1454,10 +1573,12 @@ static void compile_program(Prog *pr) {
 // Translates a program's two stages into pr (false: failed, logged). vaddr / faddr: the code's guest addresses
 // (debug names; 0 when preparing from the game files)
 static bool translate_program(Prog *pr, const uint8_t *vcode, size_t vmax, const uint8_t *fcode, size_t fmax,
-                              ShaderKey *vkey, ShaderKey *fkey, uint64_t vaddr, uint64_t faddr) {
+                              ShaderKey *vkey, ShaderKey *fkey, uint64_t vaddr, uint64_t faddr, uint32_t vcsize, uint32_t fcsize) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
+    maxwell_cb1_size = vcsize;  // (the compiler constants follow the code at vmax / fmax: 0 when they don't)
     pr->vi = maxwell_translate(vcode, vmax, STAGE_VERTEX, vkey);
+    maxwell_cb1_size = 0;
     if (!pr->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", pr->vi->error, vaddr);
         if (vaddr) {
@@ -1470,7 +1591,9 @@ static bool translate_program(Prog *pr, const uint8_t *vcode, size_t vmax, const
         return false;
     }
     fkey->vs_out_mask = pr->vi->out_mask;
+    maxwell_cb1_size = fcsize;
     pr->fi = maxwell_translate(fcode, fmax, STAGE_FRAGMENT, fkey);
+    maxwell_cb1_size = 0;
     if (!pr->fi->msl) { LOG("[shader] FS translate failed: %s\n", pr->fi->error); pr->failed = true; return false; }
     if (getenv("LARECOMP_SAVE_MSL") && vaddr) {
         mkdir("build/msl", 0755);
@@ -1579,7 +1702,8 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     size_t fmax = p->stages[1].const_offset ? p->stages[1].const_offset : 0x10000;
     if (!translate_program(pr, (const uint8_t *)(uintptr_t)p->stages[0].code_addr, vmax,
                            (const uint8_t *)(uintptr_t)p->stages[1].code_addr, fmax, vkey, fkey,
-                           p->stages[0].code_addr, p->stages[1].code_addr))
+                           p->stages[0].code_addr, p->stages[1].code_addr, p->stages[0].const_offset ? p->stages[0].const_size : 0,
+                           p->stages[1].const_offset ? p->stages[1].const_size : 0))
         return nil;
     if (sync_shaders()) {
         compile_program(pr);
@@ -1960,7 +2084,9 @@ static void bind_textures(int stage, ShaderInfo *si) {
     }
 }
 
+static uint32_t gs_rows[6];  // (the stages' rows read through snapshots, this draw / dispatch)
 static void bind_cbufs(int stage, ShaderInfo *si) {
+    gs_rows[stage] = 0;
     for (int k = 0; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
         if (k == 0) {
@@ -1975,7 +2101,8 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
             }
             uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
-            uint64_t off = ring_alloc(drv, size);
+            uint32_t gn = gsnap_stage(stage, si, drv, base, &gs_rows[stage]);
+            uint64_t off = gsnap_alloc(stage, drv, size, gn);
             if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:0];
             else [enc setFragmentBuffer:ring offset:off atIndex:0];
             continue;
@@ -2050,11 +2177,13 @@ static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3]) {
     return h;
 }
 
-static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max) {
+static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint32_t csize) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     ShaderKey k = {0};
+    maxwell_cb1_size = csize;
     cp->si = maxwell_translate(code, max, STAGE_COMPUTE, &k);
+    maxwell_cb1_size = 0;
     if (!cp->si->msl) { LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, cp->code_addr); cp->failed = true; return false; }
     return true;
 }
@@ -2100,7 +2229,8 @@ static CsProg *compute_program(NvnProgram *p) {
     shader_fp_check(&cp->fp, ss, "cs");  // (takes the fingerprint)
     cp->code_addr = ss->code_addr;
     memcpy(cp->local, local, sizeof local);
-    if (!translate_compute(cp, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000)) return NULL;
+    if (!translate_compute(cp, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000,
+                           ss->const_offset ? ss->const_size : 0)) return NULL;
     if (sync_shaders()) {
         compile_compute(cp);
         return cp->failed ? NULL : cp;
@@ -2129,6 +2259,8 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     CST("pipeline");
     [ce setComputePipelineState:cp->pipe];
     ShaderInfo *si = cp->si;
+    gs_rows[5] = 0;
+    gs_mark_stores(5, si);
     for (int k = 0; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
         uint64_t off;
@@ -2141,7 +2273,8 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
                 uint32_t *e = &drv[(0x310 + 16 * i) / 4];
                 e[0] = (uint32_t)st.sbuf[5][i].addr; e[1] = (uint32_t)(st.sbuf[5][i].addr >> 32); e[2] = (uint32_t)st.sbuf[5][i].size;
             }
-            off = ring_alloc(drv, sizeof drv);
+            uint32_t gn = gsnap_stage(5, si, drv, 0x210, &gs_rows[5]);
+            off = gsnap_alloc(5, drv, sizeof drv, gn);
         } else if (k == 1) {
             NvnShaderStage *ss = &st.program->stages[5];
             uint64_t size = ss->const_size ? ss->const_size : 16;
@@ -2164,7 +2297,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         [ce setBuffer:ring offset:off atIndex:k];
     }
     CST("gmem");
-    if (si->uses_gmem) { [ce setBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_sbufs(5); }
+    if (si->uses_gmem) { [ce setBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_rows(5, gs_rows[5]); }
     CST("textures");
     bool cmapped = si->ntex > MSL_MAX_SAMPLERS;
     __strong id<MTLSamplerState> msmp[64];
@@ -2752,9 +2885,11 @@ static void draw(CmdRec *r, bool indexed) {
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
 
     // resources
+    gs_mark_stores(0, pr->vi);
+    gs_mark_stores(1, pr->fi);
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
-    if (pr->vi->uses_gmem) { [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_sbufs(0); }
+    if (pr->vi->uses_gmem) { [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_rows(0, gs_rows[0]); }
     static id<MTLBuffer> dbgvs;
     bool dbg_this = maxwell_dbg_vs && (const uint8_t *)(uintptr_t)st.program->stages[0].code_addr == maxwell_dbg_vs;
     if (dbg_this) {
@@ -2762,7 +2897,7 @@ static void draw(CmdRec *r, bool indexed) {
         memset(dbgvs.contents, 0xff, 2 * 64 * 8 * 16);
         [enc setVertexBuffer:dbgvs offset:0 atIndex:DBG_VS_BUFFER_INDEX];
     }
-    if (pr->fi->uses_gmem) { [enc setFragmentBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_sbufs(1); }
+    if (pr->fi->uses_gmem) { [enc setFragmentBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX]; lag_note_rows(1, gs_rows[1]); }
     bind_textures(0, pr->vi);
     bind_textures(1, pr->fi);
     extern bool pets_hide_item_cursor(void);  // (the cursor is on the companion card: runtime/hle/pets.c)
@@ -3642,7 +3777,8 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
         if (have) return true;
         CsProg *cp = calloc(1, sizeof *cp);
         memcpy(cp->local, r->local, sizeof cp->local);
-        if (!translate_compute(cp, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000)) return false;
+        if (!translate_compute(cp, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000,
+                               vsb->const_offset ? vsb->const_size : 0)) return false;
         pthread_mutex_lock(&g_prep_lock);
         g_prep_cs[@(ck)] = [NSValue valueWithPointer:cp];
         pthread_mutex_unlock(&g_prep_lock);
@@ -3661,7 +3797,8 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
     if (!pr) {
         pr = [Prog new];
         translate_program(pr, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000, fsb->code,
-                          fsb->const_offset ? fsb->const_offset : 0x10000, &vkey, &fkey, 0, 0);
+                          fsb->const_offset ? fsb->const_offset : 0x10000, &vkey, &fkey, 0, 0,
+                          vsb->const_offset ? vsb->const_size : 0, fsb->const_offset ? fsb->const_size : 0);
         pthread_mutex_lock(&g_prep_lock);
         g_prep_progs[@(ck)] = pr;  // (failed ones too: the game then skips them as it would its own)
         pthread_mutex_unlock(&g_prep_lock);
