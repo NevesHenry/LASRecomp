@@ -401,6 +401,18 @@ static void create_device(void) {
     g_vk.ssbo_chunks = h->fragmentStoresAndAtomics && h->vertexPipelineStoresAndAtomics && h->robustBufferAccess;
     b->shaderClipDistance = h->shaderClipDistance;
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
+    {   // what decides how the driver may treat float edge cases and halves (issue #8: Intel's legacy driver)
+        VkPhysicalDeviceVulkan11Properties p11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+        VkPhysicalDeviceVulkan12Properties p12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, .pNext = &p11};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p12};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        LOG("[vk] device: driver %#x (%s), api %u.%u.%u, custom border colours %d, vertex divisor %d, float16 %d, subgroup %u, "
+            "fp32 inf/nan kept %d, fp32 denorms kept %d / flushed %d, fp16 inf/nan kept %d, subgroup ops %#x in stages %#x\n",
+            g_vk.props.driverVersion, p12.driverInfo, VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion),
+            VK_API_VERSION_PATCH(g_vk.props.apiVersion), g_vk.custom_border, g_vk.divisor, have12.shaderFloat16, p11.subgroupSize,
+            p12.shaderSignedZeroInfNanPreserveFloat32, p12.shaderDenormPreserveFloat32, p12.shaderDenormFlushToZeroFloat32,
+            p12.shaderSignedZeroInfNanPreserveFloat16, (unsigned)p11.subgroupSupportedOperations, (unsigned)p11.subgroupSupportedStages);
+    }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
@@ -911,6 +923,7 @@ void backend_present(NvnTexture *t) {
 // ================================================================== UI thread
 void vk_exec_init(void);
 void vk_shaders_init(void);
+void vk_float_probe(void);
 
 // exit() from any thread: let the GPU finish, keep the pipeline cache, then end the process without the DLL
 // teardown (driver / validation-layer threads can stall it for minutes while the game's threads still run).
@@ -961,6 +974,7 @@ void ui_window_init(void) {
     create_swapchain();
     vk_exec_init();
     vk_shaders_init();
+    vk_float_probe();  // (LARECOMP_VK_FLOAT_PROBE=1 only: float_probe.c)
 }
 
 SDL_Window *ui_window(void) { return window; }

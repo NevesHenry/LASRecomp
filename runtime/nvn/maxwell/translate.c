@@ -106,7 +106,43 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    bool uses_quad;          // (LARECOMP_VK_QUAD=1) subgroup quad swaps: GL_KHR_shader_subgroup_quad
+    bool kil_flag;           // (LARECOMP_VK_KIL=1) a KIL set kil_ and left the dispatcher: discard after it (glsl_finish)
 } Ctx;
+
+// (GLSL fragment) How KIL is emitted, LARECOMP_VK_KIL (diagnostics for drivers that mishandle a discard inside the
+// dispatcher loop, issue #8): 0 (default) `discard;` where the KIL is; 1: the KIL sets a flag and leaves the
+// dispatcher like EXIT, one `discard;` after it (outside every loop and switch); 2: `demote;` where the KIL is
+// (GL_EXT_demote_to_helper_invocation: the invocation runs on as a helper, its writes dropped, still there for its
+// quad neighbours' shuffles - no invocation ends inside the loop).
+static int glsl_kil_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("LARECOMP_VK_KIL"); m = e ? atoi(e) : 0; if (m < 0 || m > 2) m = 0; }
+    return m;
+}
+
+// (GLSL) LARECOMP_VK_NAN_BITS=1: isnan by the float's bits (exponent all ones, mantissa not zero) instead of the
+// built-in (every isnan of the prelude and the body becomes nanb_), so a driver that folds isnan() away (assuming no NaNs) still gets the NaN-safe saturate / fmin / fmax /
+// unordered compares the Maxwell code needs (issue #8 diagnostics). Off: the built-in, as before.
+static bool glsl_nan_bits(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_VK_NAN_BITS"); on = e && atoi(e) != 0; }
+    return on;
+}
+// (GLSL fragment) LARECOMP_VK_QUAD=1: a SHFL xor by a constant 1, 2 or 3 (the game's manual derivatives within a 2x2
+// quad) as subgroupQuadSwapHorizontal / Vertical / Diagonal, which Vulkan defines to include helper invocations,
+// instead of subgroupShuffleXor, where a helper or discarded neighbour's value is undefined (issue #8 diagnostics:
+// black specks at alpha-tested edges). Off: subgroupShuffleXor, as before.
+static bool glsl_quad_ops(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_VK_QUAD"); on = e && atoi(e) != 0; }
+    return on;
+}
+static const char glsl_nan_bits_prelude[] =
+    "bool nanb_(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) > 0x7F800000u; }\n"
+    "bvec2 nanb_(vec2 x) { return greaterThan(floatBitsToUint(x) & uvec2(0x7FFFFFFFu), uvec2(0x7F800000u)); }\n"
+    "bvec3 nanb_(vec3 x) { return greaterThan(floatBitsToUint(x) & uvec3(0x7FFFFFFFu), uvec3(0x7F800000u)); }\n"
+    "bvec4 nanb_(vec4 x) { return greaterThan(floatBitsToUint(x) & uvec4(0x7FFFFFFFu), uvec4(0x7F800000u)); }\n";
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
 static int64_t sbits(uint64_t w, int lo, int n) {
@@ -896,6 +932,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->info->uses_discard = true;
         if (getenv("LARECOMP_NO_DISCARD")) {
         } else if (!c->glsl) sp(&c->body, "    discard_fragment();\n");
+        else if (c->stage == STAGE_FRAGMENT && glsl_kil_mode() == 1) {
+            c->kil_flag = true;
+            sp(&c->body, c->branchy ? "    kil_ = true; exit_now = true; break;\n" : "    kil_ = true; break;\n");
+        } else if (c->stage == STAGE_FRAGMENT && glsl_kil_mode() == 2)
+            sp(&c->body, "    demote;\n");
         else if (c->stage == STAGE_FRAGMENT) sp(&c->body, "    discard;\n");
         else sp(&c->body, "    /* kil */\n");  // GLSL has discard in fragment shaders only
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
@@ -1645,7 +1686,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
         } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
             static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
-            sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
+            static const char *const qfn[] = {"", "subgroupQuadSwapHorizontal", "subgroupQuadSwapVertical", "subgroupQuadSwapDiagonal"};
+            uint32_t qm = (uint32_t)bits(w, 20, 5);
+            if (mode == 3 && bits(w, 28, 1) && qm >= 1 && qm <= 3 && c->stage == STAGE_FRAGMENT && glsl_quad_ops()) {
+                c->uses_quad = true;
+                sprintf(t, "%s(%s)", qfn[qm], R(a));
+            } else sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
             set_reg(c, d, t);
         } else if (mode == 3) {
             bool quad = bits(w, 28, 1) && bits(w, 20, 5) < 4;
@@ -1811,6 +1857,7 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
             if (num && atoi(id + 1) > 255) { fail(c, "register %s out of range", id); return; }
         }
         const char *rep = id;
+        if (!strcmp(id, "isnan") && glsl_nan_bits()) rep = "nanb_";
         for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
             if (!strcmp(id, map[i][0])) { rep = map[i][1]; break; }
         sp(o, "%s", rep);
@@ -1912,7 +1959,18 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     Str s = {0};
     sp(&s, "#version 460\n");  // (the prelude's first line; an extension directive has to follow it)
     if (info->uses_gmem && maxwell_gmem_chunk_shift && maxwell_gmem_lazy) sp(&s, "#extension GL_EXT_buffer_reference : require\n");
-    sp(&s, "%s", glsl_prelude + sizeof "#version 460\n" - 1);
+    if (stage == STAGE_FRAGMENT && info->uses_discard && glsl_kil_mode() == 2) sp(&s, "#extension GL_EXT_demote_to_helper_invocation : require\n");
+    if (c->uses_quad) sp(&s, "#extension GL_KHR_shader_subgroup_quad : require\n");
+    {   // (LARECOMP_VK_NAN_BITS: nanb_ goes after the extension directives, and replaces the helpers' isnan)
+        const char *rest = glsl_prelude + sizeof "#version 460\n" - 1, *defs = strstr(rest, "#define cbr");
+        if (glsl_nan_bits() && defs) {
+            sp(&s, "%.*s%s", (int)(defs - rest), rest, glsl_nan_bits_prelude);
+            for (const char *p = defs, *q; *p; p = q + 5) {
+                if (!(q = strstr(p, "isnan("))) { sp(&s, "%s", p); break; }
+                sp(&s, "%.*snanb_", (int)(q - p), p);
+            }
+        } else sp(&s, "%s", rest);
+    }
     static int exact = -1;
     if (exact < 0) exact = getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0;
     sp(&s, "%s%s", !exact && (stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE) ? glsl_h2f_native : glsl_h2f_exact,
@@ -2085,6 +2143,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
+    if (c->kil_flag) sp(&s, "  bool kil_ = false;\n");
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
@@ -2095,6 +2154,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
     }
+    if (c->kil_flag) sp(&s, "  if (kil_) discard;\n");
     free(body.buf);
     if (stage == STAGE_VERTEX) {
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");

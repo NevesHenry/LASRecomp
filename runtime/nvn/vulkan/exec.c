@@ -4916,6 +4916,9 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     // scaled / converting copy: the game builds its depth pyramid this way (nearest), colour copies filter if asked
     bool depth = (sa | da) & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
     if (depth && s->format != d->format) return;
+    static int scaled_depth = -1;  // LARECOMP_VK_DEPTH_SCALED_COPY=0 (issue #8 diagnostics): scaled depth copies left out
+    if (scaled_depth < 0) scaled_depth = getenv("LARECOMP_VK_DEPTH_SCALED_COPY") ? atoi(getenv("LARECOMP_VK_DEPTH_SCALED_COPY")) != 0 : 1;
+    if (depth && !scaled_depth) return;
     static int via_color = -1;  // LARECOMP_VK_DEPTH_BLIT_VIA_COLOR=1: always (tests on GPUs that can blit depth)
     if (via_color < 0) via_color = getenv("LARECOMP_VK_DEPTH_BLIT_VIA_COLOR") ? atoi(getenv("LARECOMP_VK_DEPTH_BLIT_VIA_COLOR")) : 0;
     if (depth && (sa & da & VK_IMAGE_ASPECT_DEPTH_BIT) && (via_color || !depth_blit_ok(d->format) || !depth_blit_ok(s->format))) {
