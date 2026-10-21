@@ -156,6 +156,14 @@ static VkFmt fmt_of(uint32_t f) {
 bool renderer_format_is_depth(uint32_t f) { return f >= 0x31 && f <= 0x36; }
 bool renderer_format_has_stencil(uint32_t f) { return f == 0x31 || f == 0x35 || f == 0x36; }
 VkFormat vk_format(uint32_t f) { return fmt_of(f).vf; }
+
+// LARECOMP_VK_DIAG_LOG=1 (issue #8 diagnostics): each distinct kind of image created, and each compute shader built
+// (exec.c), into the log - to compare one GPU's list with another's
+bool vk_diag_log(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_VK_DIAG_LOG"); on = e && atoi(e) != 0; }
+    return on;
+}
 bool vk_format_alpha_one(uint32_t f) { return fmt_of(f).alpha_one; }
 bool renderer_format_alpha_one(uint32_t f) { return fmt_of(f).alpha_one; }
 
@@ -402,6 +410,21 @@ static void create_image(NvnTexture *t, TexBackend *b) {
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkResult r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
+    if (vk_diag_log()) {  // (LARECOMP_VK_DIAG_LOG=1: each distinct kind of image once - compare GPUs' lists)
+        static uint64_t seen[1024];
+        static int nseen;
+        uint64_t key = ((uint64_t)t->format << 56) ^ ((uint64_t)vf << 40) ^ ((uint64_t)type << 36) ^ ((uint64_t)tw << 20) ^
+                       ((uint64_t)th << 4) ^ ((uint64_t)depth * 0x9E3779B1u) ^ ((uint64_t)levels << 28) ^ ((uint64_t)layers << 12) ^
+                       ((uint64_t)flags << 50) ^ ((uint64_t)usage << 44) ^ (uint64_t)samples;
+        bool fresh = true;
+        for (int i = 0; i < nseen; i++) if (seen[i] == key) { fresh = false; break; }
+        if (fresh && nseen < 1024) {
+            seen[nseen++] = key;
+            LOG("[diag] image nvn fmt %#x target %u %ux%ux%u -> vk fmt %d type %d %ux%ux%u, %u levels, %u layers, %u samples, "
+                "usage %#x, flags %#x, view formats %d%s\n", t->format, t->target, t->width, t->height, t->depth, vf, type, tw, th,
+                depth, levels, layers, samples, (unsigned)usage, (unsigned)flags, fl.viewFormatCount, r != VK_SUCCESS ? " FAILED" : "");
+        }
+    }
     if (r != VK_SUCCESS) {
         // (the Vulkan side too: a driver can refuse a format / usage / tiling combination with "out of device memory",
         // issue #45 - a GTX 1060 failing a 1920x1080 image with plenty of memory free)

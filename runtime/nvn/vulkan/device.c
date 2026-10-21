@@ -362,7 +362,24 @@ static void create_device(void) {
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .customBorderColors = VK_TRUE,
         .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
+    {   // LARECOMP_VK_COMPUTE_SG32=1 (issue #8 diagnostics): subgroup size control, so translated compute shaders with
+        // subgroup ops can ask for 32-wide subgroups (Maxwell warps; exec.c build_cs)
+        const char *sg = getenv("LARECOMP_VK_COMPUTE_SG32");
+        VkPhysicalDeviceVulkan13Features q13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        if (sg && atoi(sg)) {
+            VkPhysicalDeviceFeatures2 qf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &q13};
+            vkGetPhysicalDeviceFeatures2(g_vk.phys, &qf);
+            VkPhysicalDeviceProperties2 qp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p13};
+            vkGetPhysicalDeviceProperties2(g_vk.phys, &qp);
+            g_vk.sg32 = q13.subgroupSizeControl && p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32 &&
+                        (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+            LOG("[vk] compute subgroup size 32: %s (sizes %u-%u, stages %#x)\n", g_vk.sg32 ? "on" : "not possible here",
+                p13.minSubgroupSize, p13.maxSubgroupSize, (unsigned)p13.requiredSubgroupSizeStages);
+        }
+    }
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                            .subgroupSizeControl = g_vk.sg32,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
                                             .maintenance4 = VK_TRUE,

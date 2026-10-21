@@ -42,6 +42,7 @@ typedef struct {
     bool heap_probe;      // one import tried at the start, lazy chunks if it runs out of memory (exec.c whole_import_probe_oom)
     // on by default on integrated GPUs only (device.c; LARECOMP_VK_LEAN_USAGE / LARECOMP_VK_SMAA_STENCIL /
     // LARECOMP_NO_FRAME_CLEAR =0 / =1 override):
+    bool sg32;            // (LARECOMP_VK_COMPUTE_SG32=1, issue #8 diagnostics) compute shaders with subgroup ops run 32 wide
     bool lean_usage;      // colour images list their view formats instead of a bare MUTABLE_FORMAT (textures.c create_image)
     bool smaa_stencil;    // SMAA's weights pass only where the edge pass found edges (exec.c post_process)
     bool no_frame_clear;  // scene targets not cleared at their first use in each frame (textures.c renderer_texture_frame_fresh)
@@ -54,7 +55,8 @@ typedef struct {
     VkImage sc_images[8];
     VkImageView sc_views[8];
 } VkG;
-void vk_log_memory(const char *why);  // (device.c: per-heap budget and use, at start and on allocation failures)
+void vk_log_memory(const char *why);
+bool vk_diag_log(void);  // LARECOMP_VK_DIAG_LOG=1 (textures.c)  // (device.c: per-heap budget and use, at start and on allocation failures)
 extern VkG g_vk;
 
 // ---- submissions (exec.c)

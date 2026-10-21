@@ -3755,11 +3755,19 @@ static void build_compute(void *arg) {
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
     VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
     VkSpecializationInfo spec = {3, me, 12, cp->local};
+    const char *body = strstr(cp->si->msl, "void main()");
+    bool sgops = body && strstr(body, "subgroup");  // (a subgroup call in the body, not the prelude's extension lines)
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = 32};
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .pNext = g_vk.sg32 && sgops ? &rss : NULL,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
+    if (vk_diag_log())
+        LOG("[diag] compute %llx: local %ux%ux%u, subgroup ops %d%s\n", (unsigned long long)cp->code, cp->local[0], cp->local[1],
+            cp->local[2], sgops, g_vk.sg32 && sgops ? " (32 wide)" : "");
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
@@ -3941,8 +3949,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP_CS(!cp ? SK_NO_STAGES : atomic_load(&cp->p.state) == 2 ? SK_CS_FAILED : SK_CS_BUILDING); return; }
     {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
         static uint64_t skip = ~0ull;
-        if (skip == ~0ull) { const char *e = getenv("LARECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
-        if (skip && st.program->stages[5].code_addr == skip) { SKIP_CS(SK_DEBUG_SKIP); return; }
+        // (=all: every dispatch, issue #8 diagnostics)
+        if (skip == ~0ull) { const char *e = getenv("LARECOMP_SKIP_CS"); skip = e ? (!strcmp(e, "all") ? 1 : strtoull(e, NULL, 16)) : 0; }
+        if (skip && (skip == 1 || st.program->stages[5].code_addr == skip)) { SKIP_CS(SK_DEBUG_SKIP); return; }
     }
     if (cp->si->uses_gmem && getenv("LARECOMP_LOG_CS_SBUF")) {  // (debug) the storage buffers bound to gmem dispatches
         static uint64_t seen_cs[16];
