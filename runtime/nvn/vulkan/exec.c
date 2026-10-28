@@ -2839,7 +2839,7 @@ static VkSpan rscale_dedupe(int sg, const float rs[66][4], int nt) {
 #define SNAP_HALF (8ull << 20)
 #define SNAP_RING (2 * SNAP_HALF)
 enum { RS_PROBE, RS_COPY, RS_PLACE };
-typedef struct { uint64_t addr, size, copy, pristine, hash, frame, seg_hash[3]; uint32_t gen, level, wgen, looks; uint8_t mode, gpu_parts, wclass; bool cs_bound, draw_bound; } RangeState;  // (wgen, seg_hash, looks, gpu_parts, wclass: watch_check; pristine: rs_copy_make)
+typedef struct { uint64_t addr, size, copy, pristine, hash, frame, seg_hash[3]; uint32_t gen, level, wgen, looks; uint8_t mode, gpu_parts, wclass, rewrites; bool cs_bound, draw_bound; } RangeState;  // (wgen, seg_hash, looks, gpu_parts, wclass: watch_check; pristine: rs_copy_make; rewrites: watch_cpu_in_allocation)
 static RangeState rs_tab[512];
 static uint64_t rs_store_frame[512];  // (watch: the frame of the previous CPU write seen on a range's own pages)
 static int nrs;
@@ -3109,7 +3109,14 @@ static bool watch_small_mate(const RangeState *e, uint64_t plo) {
 // lands on a page wholly inside the range or inside its allocation - the watched ranges of 256 bytes or more around it,
 // less than 256 bytes apart, compute-bound: the light / exposure lists, one allocation the CPU memcpys (its two big
 // lists' pages) while the exposure program stores into the small ones, which share their pages with each other.
+// Another range's pages count only once that range was copied for writes on pages wholly its own (rewrites): BowWow's
+// skinning outputs (22048 / 3104 bytes, 66144 for the small BowWows) lie back to back, under 256 bytes apart, and his
+// spawn makes one initialisation store into each - counted for every neighbour, two spawns' worth within 8 frames
+// copied one, the dispatch wrote the copy while the CPU read the frozen original, and his body came apart after an
+// area load (#463; Metal ebe19c7). The big light lists are rewritten every frame: copied for their own writes a frame
+// or two before the small ones follow.
 // 1: a CPU write since `since`, 0: none seen.
+static const char *watch_why;  // (the evidence watch_check's last 1 rests on: the copy decision's log)
 static int watch_cpu_in_allocation(const RangeState *e, uint32_t since) {
     uint64_t lo = e->addr, hi = e->addr + e->size;
     for (bool grew = true; grew;) {
@@ -3123,10 +3130,10 @@ static int watch_cpu_in_allocation(const RangeState *e, uint32_t since) {
     }
     for (int k = -1; k < nrs; k++) {  // (e itself, then the allocation's other ranges: a page wholly inside one of them)
         const RangeState *o = k < 0 ? e : &rs_tab[k];
-        if (k >= 0 && (o == e || o->size < 256 || !o->cs_bound || o->addr < lo || o->addr + o->size > hi)) continue;
+        if (k >= 0 && (o == e || !o->rewrites || o->size < 256 || !o->cs_bound || o->addr < lo || o->addr + o->size > hi)) continue;
         uint64_t p1 = (o->addr + WATCH_PAGE - 1) & ~(WATCH_PAGE - 1), pe = (o->addr + o->size) & ~(WATCH_PAGE - 1);
         uint32_t g;
-        if (p1 < pe && pages_cpu_written(p1, pe - p1, since, &g) == 1) return 1;
+        if (p1 < pe && pages_cpu_written(p1, pe - p1, since, &g) == 1) { watch_why = k < 0 ? "a page wholly its own" : "a page of a rewritten range beside it"; return 1; }
     }
     return 0;
 }
@@ -3137,7 +3144,9 @@ static int watch_check(RangeState *e) {
     e->wgen = now;
     if (w < 0) return w;
     if (e->wclass & 1) return w == 1 ? watch_cpu_in_allocation(e, since) : 0;  // (a program stores into it: the GPU said so)
+    watch_why = "a page of a small range";
     if (e->size < 256) return w;
+    watch_why = "a page of an input";
     if (e->wclass == 2) {  // (only ever bound where its programs don't store: an input - every dirty page counts, e69a0df)
         if (w != 1) return 0;
         for (uint64_t plo = e->addr & ~(WATCH_PAGE - 1); plo < e->addr + e->size; plo += WATCH_PAGE)
@@ -3164,7 +3173,9 @@ static int watch_check(RangeState *e) {
     }
     e->looks++;
     if (w != 1) return 0;
+    watch_why = "a page wholly its own";
     if (lo[1] < hi[1] && pages_seen_written(lo[1], hi[1] - lo[1], since) == 1) return 1;  // (a page wholly its own)
+    watch_why = "its first / last page, shared";
     if (e->looks < 3) return 0;  // (a new range: the GPU's first writes first)
     for (int i = 0; i < 3; i += 2) {  // its first and last page, shared with other memory
         if (lo[i] >= hi[i]) continue;
@@ -3273,13 +3284,23 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
         return c ? c : addr;
     }
     if (e->mode == RS_PLACE && e->cs_bound && watch_on()) {  // (tracked: the OS's dirty bits decide, no hash)
+        uint32_t since = e->wgen;
         if (watch_check(e) != 1) return addr;
         // A write once (an initialisation: BowWow's skinning buffers at his spawn) stays in place; writes that keep
         // coming (within 8 frames of the previous one) are the CPU rewriting it: copied from now on (renderer.m 1ea4b16)
         int k = (int)(e - rs_tab);
         if (!rs_store_frame[k] || f - rs_store_frame[k] > 8) { rs_store_frame[k] = f; return addr; }
         e->mode = RS_COPY;
-        rs_log(e, "-> copy (CPU writes keep coming on its own pages)", cs_slot, f);
+        {   // (written on a page wholly its own: the CPU rewrites the range itself - its allocation's other ranges count its pages now)
+            uint64_t p1 = (addr + WATCH_PAGE - 1) & ~(WATCH_PAGE - 1), pe = (addr + size) & ~(WATCH_PAGE - 1);
+            e->rewrites = p1 < pe && pages_seen_written(p1, pe - p1, since) == 1;
+        }
+        {
+            char why[160];
+            snprintf(why, sizeof why, "-> copy (CPU writes keep coming on its own pages: %s; %s)", watch_why,  // (wclass: is it a GPU output?)
+                     e->wclass & 1 ? "a program stores into it" : e->wclass == 2 ? "an input" : "use not known yet");
+            rs_log(e, why, cs_slot, f);
+        }
         c = rs_copy_make(e, range_hash(addr, size));
         return c ? c : addr;
     }
@@ -6410,10 +6431,13 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     if (depth && s->format != d->format) return;
     static int via_color = -1;  // LARECOMP_VK_DEPTH_BLIT_VIA_COLOR=1: always (tests on GPUs that can blit depth)
     if (via_color < 0) via_color = getenv("LARECOMP_VK_DEPTH_BLIT_VIA_COLOR") ? atoi(getenv("LARECOMP_VK_DEPTH_BLIT_VIA_COLOR")) : 0;
-    // an upsampling depth copy interpolates (as metal.m / renderer.m do: issue #356); LARECOMP_DEPTH_UP_NEAREST=1: as before
+    // a depth copy that upsamples, or rescales by an uneven ratio between images of different scales (the AO depth at the
+    // Deck's 0.667x: 640x400 -> 480x270, issue #413), interpolates (as metal.m / renderer.m do: issue #356); nearest
+    // skipped rows unevenly there. LARECOMP_DEPTH_UP_NEAREST=1: as before
     static int up_nearest = -1;
     if (up_nearest < 0) up_nearest = getenv("LARECOMP_DEPTH_UP_NEAREST") != NULL;
-    if (depth && !up_nearest && (sa & da & VK_IMAGE_ASPECT_DEPTH_BIT) && (dw > sw || dh > sh) &&
+    bool uneven = dw > sw || dh > sh || ((ssx != dsx || ssy != dsy) && (sw % dw || sh % dh));
+    if (depth && !up_nearest && (sa & da & VK_IMAGE_ASPECT_DEPTH_BIT) && uneven &&
         depth_upsample_draw(cb, s, d, slv, sly, sx0, sy0, sw, sh, dlv, dly, dx0, dy0, dw, dh))
         return;
     if (depth && (sa & da & VK_IMAGE_ASPECT_DEPTH_BIT) && (via_color || !depth_blit_ok(d->format) || !depth_blit_ok(s->format))) {
