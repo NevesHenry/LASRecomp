@@ -24,8 +24,14 @@ that no longer holds, so for every shuffled dungeon this module builds the logic
              such a token sat inside an OR, the OR becomes an AND - stricter, never weaker). A check whose room isn't
              used anywhere is excluded (junk). Dungeon items go to the dungeon a check physically is in now.
 
+  shutters   by what opens each one (shutter_req): the enemies its kill-all trigger watches (or the mini-boss / boss
+             that drives it; a shutter nothing drives: every enemy in the room) -> their LAS kill rules (kill-spiny,
+             kill-pols-voice...; the pit variant in rooms with pits). Those enemies always stay vanilla (LAS enemies.py
+             kill_linked). A switch / block / floor tile -> something to hit switches with; anything else -> something
+             to fight with.
+
 Not modelled yet (stricter or approximate): what a room needs to cross it between two doorways (pits, water,
-blocks inside the room), the exact enemies / switches behind each shutter, key counts along paths.
+blocks inside the room), key counts along paths.
 """
 import json
 import os
@@ -41,9 +47,10 @@ LEVELS = {
     'Lv03KeyCavern': (3, 'key-cavern'), 'Lv04AnglersTunnel': (4, 'angler-tunnel'), 'Lv05CatfishsMaw': (5, 'catfish-maw'),
     'Lv06FaceShrine': (6, 'face-shrine'), 'Lv07EagleTower': (7, 'eagle-tower'), 'Lv08TurtleRock': (8, 'turtle-rock'),
 }
-SHUTTER = 'sword | shoot-arrows | bombs | rod | boomerang | hookshot'  # fight the room's enemies / hit its switches
+SHUTTER = 'sword | shoot-arrows | bombs | rod | boomerang'  # a shutter whose enemies LAS has no kill rule for (the
+SWITCH_SHUTTER = 'sword | shoot-arrows | bombs | rod | boomerang | hookshot'  # hookshot only stuns) / a switch's shutter
 DOOR_REQ = {'cracked': 'bombs', 'potdoor': 'break-pot', 'blocked:water': 'flippers', 'blocked:crystal': 'break-crystal',
-            'blocked:block': None, 'shutter': 'rs-shutter'}
+            'blocked:block': None, 'shutter': 'rs-shutter'}  # (shutters: shutter_req, this only without the room)
 IMPASSABLE = {'blocked:statue', 'blocked:chest'}
 STEP = {'N': (0, -1), 'S': (0, 1), 'W': (-1, 0), 'E': (1, 0)}
 OPP = {'N': 'S', 'S': 'N', 'W': 'E', 'E': 'W'}
@@ -265,12 +272,129 @@ def lock_blocks(romfs, room):
     return _block_cache[room]
 
 
-def door_terms(types, n, entering=False, room_types=(), lock_id=''):
+# enemy actor type -> the LAS kill rules (logic.yml) a shutter waiting for it needs. Types not listed: SHUTTER.
+KILL = {0x1b: ('kill-zol-green',), 0x1c: ('kill-zol-red',), 0x1d: ('kill-zol-green',),  # (0x1d: Gels, as Zols)
+        0x24: ('kill-hardhat-beetle',), 0x25: ('kill-rope',), 0x26: ('kill-vire',), 0x27: ('kill-minimoldorm',),
+        0x28: ('kill-spiny',), 0x2e: ('kill-stalfos-spear',), 0x33: ('kill-gibdo',), 0x34: ('kill-keese',),
+        0x31: ('kill-bombite-red', 'kill-bombite-green'), 0x32: ('kill-bombite-red', 'kill-bombite-green'),  # (LAS's
+        0x37: ('kill-pols-voice',), 0x38: ('kill-like-like',), 0x39: ('kill-stalfos',),  # D3-triple-bombites: both)
+        0x3a: ('kill-stalfos',), 0x3b: ('kill-wizzrobe',), 0x40: ('kill-helmasaur',), 0x41: ('kill-shy-guy',),
+        0x42: ('kill-pairodd',), 0x43: ('kill-water-tektite',), 0x44: ('kill-star',)}
+NOT_COUNTED = (0x3d, 0xb7)  # Sparks, Bubbles: no kill-all check waits for them
+PIT_KILLS = ('kill-hardhat-beetle', 'kill-spiny', 'kill-stalfos', 'kill-wizzrobe', 'kill-zol-red')  # (condition-pit)
+KILL_TRIGGERS = (0xF0, 0x1B9, 0x247)  # TagHolocaust, TagPopChecker, TagHistoricalHolocaustChecker: watched enemies dead
+
+
+def _kills():
+    import souls  # (bosses / mini-bosses that drive their arena's shutters)
+    out = dict(KILL)
+    for _, _, t, kill, _ in souls.BOSSES:
+        out[t] = (kill,)
+    for _, t, kill, _ in souls.MINIBOSSES:
+        if kill:
+            out[t] = (kill,)
+    return out
+
+
+_shutter_cache = {}
+_level_cache = {}
+
+
+def _level_rooms(romfs, level):
+    from RandomizerCore.Tools import leb
+    if level not in _level_cache:
+        d = os.path.join(romfs, 'region_common', 'level', level)
+        _level_cache[level] = {f[:-4]: leb.Room(open(os.path.join(d, f), 'rb').read())
+                               for f in sorted(os.listdir(d)) if f.endswith('.leb')}
+    return _level_cache[level]
+
+
+def has_pits(r):
+    """A room file with pits (grid tiles: byte 0 bit 0, or sunk below -0.3, that aren't water / lava)."""
+    import struct
+    import rooms as _rooms
+    g = _rooms._grid(r)
+    raw = g[b'data'].data if g and b'data' in g else b''
+    return any((raw[o] & 1 or struct.unpack_from('<f', raw, o + 12)[0] < -0.3) and not raw[o + 2] & 4
+               for o in range(0, len(raw) - 15, 16))
+
+
+def shutter_req(romfs, room, side):
+    """frozenset of atoms the room's own shutter(s) on that side need to open: what opens it (see the docstring)."""
+    key = (room, side)
+    if key in _shutter_cache:
+        return _shutter_cache[key]
+    sys.path.insert(0, os.path.join(HERE, '..', '..', 'third_party', 'LAS-Randomizer'))
+    import rooms as _rooms
+    level = room.rsplit('_', 1)[0]
+    try:
+        lvl = _level_rooms(romfs, level)
+        r = lvl[room]
+    except (OSError, KeyError):
+        _shutter_cache[key] = frozenset({'rs-shutter'})
+        return _shutter_cache[key]
+    kills, pits = _kills(), has_pits(r)
+    A = r.actors
+
+    def atoms(acts):  # the kill rules for these enemies (rs-shutter for one LAS has no rule for)
+        out = set()
+        for a in acts:
+            if a.type not in NOT_COUNTED:
+                out.update(f'{k}[pit]' if pits and k in PIT_KILLS else k for k in kills.get(a.type, ('rs-shutter',)))
+        return out
+
+    def watched(t, acts):
+        return [acts[s[1]] for s in t.relationships.section_1 if 0 <= s[1] < len(acts)]
+
+    x0, z0 = _rooms.cell_origin(room)
+    req = set()
+    for i, a in enumerate(A):
+        if a.type != 0xEF:
+            continue
+        lx, lz = a.posX - x0, a.posZ - z0
+        d = {'W': lx, 'E': 15.0 - lx, 'N': lz, 'S': 12.0 - lz}
+        if min(d, key=d.get) != side:
+            continue
+        flag = next((f for t, f in a.switches if t == 1), None)
+        drivers = [b for j, b in enumerate(A) if j != i and b.type != 0xEF and
+                   i in [s[1] for s in b.relationships.section_1]]
+        got = None
+        if drivers:  # a mini-boss / boss (its relationships open the doors)
+            got = atoms(drivers)
+        elif flag is None:  # nothing drives it: the room's own all-enemies-dead check (LAS keeps them all vanilla)
+            enemies = [b for b in A if b.name.startswith(b'Enemy')]
+            got = atoms(enemies) if enemies else None
+        else:  # opened by its flag: a kill-all trigger here (or in another room of the level), or a switch
+            setters = [b for b in A if b.type != 0xEF and (1, flag) in [tuple(s) for s in b.switches]]
+            trig = [b for b in setters if b.type in KILL_TRIGGERS]
+            if not trig and not setters:
+                for other, ro in lvl.items():
+                    if other != room:
+                        trig += [b for b in ro.actors if b.type in KILL_TRIGGERS and
+                                 (1, flag) in [tuple(s) for s in b.switches]]
+                        if trig:
+                            A2 = ro.actors
+                            break
+            else:
+                A2 = A
+            if trig:
+                got = set().union(*(atoms(watched(t, A2)) for t in trig))
+            elif setters:  # a floor switch, block, tile, horse head...
+                got = {'rs-switch-shutter'}
+        req |= got if got else {'rs-shutter'}
+    _shutter_cache[key] = frozenset(req or {'rs-shutter'})
+    return _shutter_cache[key]
+
+
+def door_terms(types, n, entering=False, room_types=(), lock_id='', shutter=None):
     """frozenset of requirement atoms for passing these door types, or None if impassable. entering: going INTO the
     room that owns the doors (else leaving it). A one-way door passes one way: out of the room with the 0x1A3 half,
-    into the room with the 0x1A4 half."""
+    into the room with the 0x1A4 half. shutter: what the owner's shutter on that side needs (shutter_req)."""
     req = set()
     for t in types:
+        if t == 'shutter' and shutter:
+            req |= shutter
+            continue
         if t == 'oneway':
             if (ONEWAY_IN if entering else ONEWAY_OUT) in room_types:
                 continue
@@ -396,7 +520,8 @@ def level_graph(cat, romfs, level, layout, jump_rows, openings):
         if target not in layout:
             continue
         req = door_terms(own_doors(cat, layout[cell], side, own), n, room_types=cat[layout[cell]].get('types', ()),
-                         lock_id=lock_flag(romfs, layout[cell], side) or f'{cell}{side}{own}')
+                         lock_id=lock_flag(romfs, layout[cell], side) or f'{cell}{side}{own}',
+                         shutter=shutter_req(romfs, layout[cell], side))
         if req is not None:
             edges[cell].append((target, req))
     for cell, room in layout.items():
@@ -418,10 +543,12 @@ def level_graph(cat, romfs, level, layout, jump_rows, openings):
                 if (cell, side, slot) in jumped or (slot not in theirs and not home_pair):
                     continue
                 req_out = door_terms(own_doors(cat, room, side, slot), n, room_types=cat[room].get('types', ()),
-                                     lock_id=lock_flag(romfs, room, side) or f'{cell}{side}{slot}')
+                                     lock_id=lock_flag(romfs, room, side) or f'{cell}{side}{slot}',
+                                     shutter=shutter_req(romfs, room, side))
                 req_in = door_terms(own_doors(cat, layout[nb], OPP[side], slot), n, entering=True,
                                     room_types=cat[layout[nb]].get('types', ()),
-                                    lock_id=lock_flag(romfs, layout[nb], OPP[side]) or f'{nb}{OPP[side]}{slot}')
+                                    lock_id=lock_flag(romfs, layout[nb], OPP[side]) or f'{nb}{OPP[side]}{slot}',
+                                    shutter=shutter_req(romfs, layout[nb], OPP[side]))
                 if req_out is None or req_in is None:
                     continue
                 edges[cell].append((nb, req_out | req_in))
@@ -521,6 +648,7 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
     cell_expr = {}  # (level, cell) -> condition string
     lock_count = {}
     logic_defs['rs-shutter'] = {'type': 'interaction', 'condition-basic': SHUTTER}
+    logic_defs['rs-switch-shutter'] = {'type': 'interaction', 'condition-basic': SWITCH_SHUTTER}
     boss_cell = {}
     junk_delta = [0]
     kcs = {}
@@ -709,6 +837,8 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
             excluded.add(loc), absent.add(loc)
             unused += 1
             continue
+        # (a pot: its room's vanilla way in isn't this room's business - only what the pot itself needs)
+        cond = v.get('room-local', cond)
         local, _ = strip(parse(cond), drop)
         lvl_now = next((p for p in places if LEVELS[p[0]][0] == home), places[0])[0]
         if 'hit-crystal-switch' in cond and not crystal.get(lvl_now):
