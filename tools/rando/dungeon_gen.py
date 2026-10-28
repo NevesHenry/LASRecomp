@@ -1495,8 +1495,15 @@ def write(romfs, out, level, layout, entrance, own_zones=False, all_starts=False
                    if (c0 + dc, r0 + dr) in here]
         flags.keep = kept_global if src.rsplit('_', 1)[0] == level else set()  # (only this level's own rooms)
         sibs = {(cell_pos(u)[0] - sc, cell_pos(u)[1] - sr) for u in unit} if whole else set()
+        # neighbours its own lid / fade weren't made for: a room now where the source's own dungeon had none. Its
+        # models were shaped around the rooms it had there (Turtle Rock 02E's fade reaches over 03E): counted as
+        # covering them, 01E|02E got the generic fade - a dark seam across the room (user 2026-10-28, Coupled seed)
+        src_lv = rooms.level_of(src)
+        src_cells = {cell_pos(k) for k in cat if rooms.level_of(k) == src_lv} | \
+                    {cell_pos(k) for k in rooms.DEAD if rooms.level_of(k) == src_lv}
         others = [(dc, dr) for dc in (-1, 0, 1) for dr in (-1, 0, 1)
-                  if (dc, dr) != (0, 0) and (c0 + dc, r0 + dr) in here and (dc, dr) not in sibs]
+                  if (dc, dr) != (0, 0) and (c0 + dc, r0 + dr) in here and (dc, dr) not in sibs
+                  and (sc + dc, sr + dr) not in src_cells]
         _fix_room(romfs, out, cell, src, None if keep else zone_ids[cell], kept_flags if keep else flags, missing, whole,
                   corners, others)
         area, own = _source_records(romfs, src)
