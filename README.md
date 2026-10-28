@@ -200,7 +200,8 @@ without touching the installed game, your game files or your saves.
 - **[@theb0rg](https://github.com/theb0rg)** - the fix for AMD integrated graphics on Windows (#335)
 - **[@gtf-dot](https://github.com/gtf-dot)** - the game-text font on Linux (#330)
 - **[@cfcosta](https://github.com/cfcosta)** - full speed on Linux AMD handhelds like the Steam Deck and ROG Ally (#392)
-- **[@gsel001](https://github.com/gsel001)** - a check in CI that the Mac app starts (#420)
+- **[@gsel001](https://github.com/gsel001)** - a check in CI that the Mac app starts (#420), and rupees up to 9,999 in the
+  cheats and save editor (#453)
 - **[@wimw85](https://github.com/wimw85)** - much faster game code setup on the Steam Deck and other PCs (#434)
 
 Thanks also to everyone who reports issues and tests builds. Your logs and screenshots find most of the bugs.
