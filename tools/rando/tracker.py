@@ -314,7 +314,8 @@ def build(seed_dir, romfs):
             c = ln.rstrip('\n').split('\t')
             if len(c) >= 3:
                 layout[(c[0], c[1])] = c[2]
-                rooms_at.setdefault(c[2], []).append((c[0], c[1]))
+                if c[3:4] != ['copy']:  # (a room's second copy holds no checks: dungeon_gen._even_stubs)
+                    rooms_at.setdefault(c[2], []).append((c[0], c[1]))
     shifts = {}
     p = os.path.join(seed_dir, 'dungeon_map.tsv')
     if os.path.exists(p):
