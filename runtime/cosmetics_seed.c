@@ -11,6 +11,7 @@
 #include "cosmetic_colour.h"
 #include "hle.h"
 #include "rando.h"
+#include "settings.h"
 
 static char g_dir[300] = "\1";  // (the seed the picks were made for; seeds switch in place)
 static uint32_t g_rgb[COL_SLOTS];  // (0xRRGGBB, one per row)
@@ -23,8 +24,14 @@ static uint32_t mix32(uint32_t h) {
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;  // (draws on the render thread, the menu on the UI's)
 
+// On the start screen: the seed PLAY would start (g_settings.rando_seed), read from its folder - rando_seed_dir() would
+// apply its patches before the game is loaded (the Cosmetics tab's colour rows crashed there; hookshot.c does the same)
+extern int g_start_screen;  // warp.c
 static void refresh_locked(void) {
-    const char *dir = rando_seed_dir();
+    char sdir[256];
+    const char *dir = NULL;
+    if (!g_start_screen) dir = rando_seed_dir();
+    else if (g_settings.rando_seed[0]) dir = (snprintf(sdir, sizeof sdir, "rando/%s", g_settings.rando_seed), sdir);
     if (!strcmp(dir ? dir : "", g_dir)) return;
     snprintf(g_dir, sizeof g_dir, "%s", dir ? dir : "");
     g_on = false;
